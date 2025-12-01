@@ -337,11 +337,10 @@ def main():
     parser.add_argument(
         "--storage-class",
         default="STANDARD",
-        help=(
-            "S3 storage class for newly created objects. "
-            "Examples: STANDARD, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, "
-            "GLACIER, GLACIER_IR, DEEP_ARCHIVE. Default: STANDARD."
-        ),
+        help=("""S3 storage class for newly created objects.
+            Examples: STANDARD, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING,
+            GLACIER, GLACIER_IR, DEEP_ARCHIVE. Default: STANDARD. """
+         ),
     )
     parser.add_argument("--scratch-dir", default=None)
     parser.add_argument("--compression", choices=["none", "gz"], default="none")
@@ -354,7 +353,7 @@ def main():
         type=int,
         default=1_000_000_000,
         help=(
-            "Files larger than this (in bytes) are stored as individual S3 objects. "
+            "Files larger than this in bytes are stored as individual S3 objects. "
             "Default: 1e9."
         ),
     )
@@ -372,6 +371,18 @@ def main():
         type=int,
         default=4,
         help="Maximum number of parallel upload workers (default: 4).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be uploaded, but do not create tars, upload, or delete anything.",
+    )
+
+    parser.add_argument(
+        "--no-summary",
+        action="store_false",
+        dest="summary",
+        help="Print a summary of files, bytes, and objects created.",
     )
 
     args = parser.parse_args()
@@ -551,6 +562,21 @@ def main():
         else:
             raise RuntimeError(f"Unknown job kind: {kind}")
 
+    # --- DRY RUN MODE ----------------------------------------------------
+    if args.dry_run:
+        total_files = len(files)
+        total_bytes = sum(rec["size_bytes"] for rec in files)
+        num_objects = len(jobs)
+
+        print("\nDRY RUN SUMMARY:")
+        print(f"  Total files:      {total_files}")
+        print(f"  Total bytes:      {total_bytes}")
+        print(f"  Objects to create:{num_objects}")
+        print(f"  Large files:      {len(large_files)}")
+        print(f"  Small-file groups:{len(groups)}")
+        print("\nNo uploads performed.")
+        return
+
     # Run jobs in parallel
     max_workers = max(1, args.max_workers)
     vprint(verbose, f"Starting upload with up to {max_workers} workers...")
@@ -601,9 +627,18 @@ def main():
     vprint(verbose, f"Removing directory tree {root_dir}")
     shutil.rmtree(root_dir)
 
+    # --- SUMMARY ---------------------------------------------------------
+    if args.summary:
+        total_files = len(files)
+        total_bytes = sum(rec["size_bytes"] for rec in files)
+        num_objects = len(objects)
+
+        print("\nArchive summary:")
+        print(f"  Total files:      {total_files}")
+        print(f"  Total bytes:      {total_bytes}")
+        print(f"  Objects created:  {num_objects}")
+
     vprint(verbose, "Done.")
-
-
     
 if __name__ == "__main__":
     main()

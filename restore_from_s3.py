@@ -11,11 +11,13 @@ Supports inventories produced by the multi-object archive script, where:
 Deep Glacier–aware:
 
 - Detects GLACIER / DEEP_ARCHIVE / GLACIER_IR storage classes.
-- Checks the Restore header to see if the object is temporarily restored.
-- If not restored:
-    * Fails with an explanatory message by default.
-    * With --auto-request-restore, sends a restore request and exits so
-      you can rerun the script after the restore completes.
+- Before downloading, checks all required objects via head_object:
+    * If all are "ready", proceeds with parallel download.
+    * If any are not ready:
+        - Prints status for each required object.
+        - If --auto-request-restore is set, submits restore requests for
+          cold Glacier/Deep Archive objects.
+        - Then exits without downloading.
 
 Parallel:
 
@@ -157,44 +159,42 @@ def select_relpaths(inventory, only_paths=None, only_prefixes=None, verbose=Fals
 
 # ---------- Glacier / Deep Archive Helpers ----------
 
-def ensure_restored_or_request(
-    bucket,
-    key,
-    s3_client,
-    auto_request=False,
-    restore_days=7,
-    restore_tier="Standard",
-    verbose=False,
-):
+def classify_object_status(bucket, key, s3_client, verbose=False):
     """
-    Ensure an S3 object is in a downloadable state.
+    Inspect a single S3 object and classify its availability.
 
-    - Performs head_object to inspect StorageClass and Restore header.
-    - If the object is STANDARD / IA / etc., returns the head_object response.
-    - If the object is GLACIER / DEEP_ARCHIVE / GLACIER_IR:
-        * If already restored (Restore header ongoing-request="false"), return.
-        * If not restored:
-            - If auto_request=False: raise RuntimeError with instructions.
-            - If auto_request=True: call restore_object and then raise
-              RuntimeError telling the caller to rerun later.
-
-    Returns:
-        resp (dict): head_object response if object is ready to download.
-
-    Raises:
-        RuntimeError: if object is not yet restored or restore was just requested.
+    Returns a dict with:
+      {
+        "status": one of {"ready", "cold", "restoring", "error"},
+        "storage_class": str or None,
+        "restore_header": str or None,
+        "error": str or None,
+      }
     """
     try:
         resp = s3_client.head_object(Bucket=bucket, Key=key)
     except ClientError as e:
-        raise RuntimeError(f"head_object failed for s3://{bucket}/{key}: {e}") from e
+        msg = f"head_object failed: {e}"
+        vprint(verbose, f"s3://{bucket}/{key}: ERROR {msg}")
+        return {
+            "status": "error",
+            "storage_class": None,
+            "restore_header": None,
+            "error": msg,
+        }
 
     storage_class = resp.get("StorageClass", "STANDARD")
     restore_hdr = resp.get("Restore")
 
     if storage_class not in GLACIER_CLASSES:
         # Not in a Glacier class; ready to download
-        return resp
+        vprint(verbose, f"s3://{bucket}/{key} is in {storage_class} and ready.")
+        return {
+            "status": "ready",
+            "storage_class": storage_class,
+            "restore_header": restore_hdr,
+            "error": None,
+        }
 
     # In Glacier / Deep Archive class
     vprint(verbose, f"s3://{bucket}/{key} is in storage class {storage_class}")
@@ -203,48 +203,170 @@ def ensure_restored_or_request(
         # Already temporarily restored
         vprint(verbose, f"Object s3://{bucket}/{key} is already restored "
                         f"(Restore header: {restore_hdr})")
-        return resp
+        return {
+            "status": "ready",
+            "storage_class": storage_class,
+            "restore_header": restore_hdr,
+            "error": None,
+        }
 
-    # Not yet restored or still restoring
     if restore_hdr and 'ongoing-request="true"' in restore_hdr:
-        msg = (f"Object s3://{bucket}/{key} is in {storage_class} and a restore "
-               f"request is already in progress (Restore header: {restore_hdr}).\n"
-               f"Wait for the restore to complete, then rerun restore_from_s3.py.")
-        raise RuntimeError(msg)
+        # Restore in progress
+        vprint(verbose, f"Object s3://{bucket}/{key} restore in progress "
+                        f"(Restore header: {restore_hdr})")
+        return {
+            "status": "restoring",
+            "storage_class": storage_class,
+            "restore_header": restore_hdr,
+            "error": None,
+        }
 
-    # No restore in progress and object is cold
-    if not auto_request:
-        msg = (
-            f"Object s3://{bucket}/{key} is in {storage_class} and not restored.\n"
-            f"Use --auto-request-restore to submit a restore request, then rerun this "
-            f"script after the restore completes."
-        )
-        raise RuntimeError(msg)
+    # Cold, no restore requested yet
+    vprint(verbose, f"Object s3://{bucket}/{key} is cold (no restore in progress).")
+    return {
+        "status": "cold",
+        "storage_class": storage_class,
+        "restore_header": restore_hdr,
+        "error": None,
+    }
 
-    # auto_request == True: submit a restore request
+
+def request_restore(bucket, key, s3_client, restore_days, restore_tier, verbose=False):
+    """
+    Submit a restore request for a cold Glacier/Deep Archive object.
+    """
     vprint(verbose, f"Requesting restore for s3://{bucket}/{key} "
-                    f"(storage class: {storage_class}, tier: {restore_tier}, days: {restore_days})")
-
+                    f"(tier={restore_tier}, days={restore_days})")
     restore_request = {
         "Days": restore_days,
         "GlacierJobParameters": {
             "Tier": restore_tier
-        }
+        },
     }
-
     try:
         s3_client.restore_object(Bucket=bucket, Key=key, RestoreRequest=restore_request)
     except ClientError as e:
-        raise RuntimeError(
-            f"Failed to submit restore request for s3://{bucket}/{key}: {e}"
-        ) from e
+        print(f"ERROR: Failed to submit restore request for s3://{bucket}/{key}: {e}", file=sys.stderr)
+        return False
 
-    msg = (
-        f"Submitted restore request for s3://{bucket}/{key}.\n"
-        f"Wait for AWS to complete the restore (which can take hours), then rerun "
-        f"restore_from_s3.py to actually download and restore files."
+    print(
+        f"Submitted restore request for s3://{bucket}/{key} "
+        f"(tier={restore_tier}, days={restore_days})."
     )
-    print(msg)
+    return True
+
+
+def preflight_check_objects(
+    bucket,
+    jobs,
+    s3_client,
+    auto_request=False,
+    restore_days=7,
+    restore_tier="Standard",
+    verbose=False,
+):
+    """
+    Preflight all required objects before any download.
+
+    - Checks each object's availability via head_object.
+    - Prints status for each required object.
+    - If any are not "ready":
+        * If auto_request=True: submits restore requests for "cold" objects.
+        * Exits the program without starting download.
+
+    If all required objects are ready, returns normally.
+    """
+    if not jobs:
+        vprint(verbose, "No S3 objects required for this restore (nothing to do).")
+        return
+
+    print("Checking availability of required S3 objects...\n")
+
+    statuses = {}  # object_id -> status dict
+    any_not_ready = False
+
+    for oid, _rels, obj in jobs:
+        key = obj.get("s3_key")
+        if not key:
+            statuses[oid] = {
+                "status": "error",
+                "storage_class": None,
+                "restore_header": None,
+                "error": "missing s3_key in inventory",
+            }
+            any_not_ready = True
+            continue
+
+        st = classify_object_status(bucket, key, s3_client, verbose=verbose)
+        statuses[oid] = st
+        if st["status"] != "ready":
+            any_not_ready = True
+
+    # Print status for each required object
+    print("Object availability status:")
+    for oid, _rels, obj in jobs:
+        key = obj.get("s3_key", "?")
+        st = statuses.get(oid, {"status": "error", "storage_class": None, "restore_header": None, "error": "unknown"})
+        status = st["status"]
+        sc = st["storage_class"]
+        hdr = st["restore_header"]
+        err = st["error"]
+
+        if status == "ready":
+            msg = "ready"
+        elif status == "cold":
+            msg = "cold (in Glacier/Deep Archive, no restore in progress)"
+        elif status == "restoring":
+            msg = "restoring (restore in progress)"
+        else:
+            msg = f"error ({err})"
+
+        print(f"  object_id={oid}")
+        print(f"    key:           {key}")
+        print(f"    storage_class: {sc}")
+        print(f"    status:        {msg}")
+        if hdr:
+            print(f"    Restore hdr:   {hdr}")
+        print()
+
+    if not any_not_ready:
+        print("All required objects are ready for download.\n")
+        return
+
+    # At least one object is not ready
+    print("One or more required objects are not currently available for download.\n")
+
+    if auto_request:
+        print("Submitting restore requests for cold Glacier/Deep Archive objects...\n")
+        for oid, _rels, obj in jobs:
+            key = obj.get("s3_key")
+            st = statuses.get(oid)
+            if not st:
+                continue
+            if st["status"] == "cold":
+                request_restore(
+                    bucket,
+                    key,
+                    s3_client,
+                    restore_days=restore_days,
+                    restore_tier=restore_tier,
+                    verbose=verbose,
+                )
+
+        print(
+            "\nRestore requests (if any) have been submitted. "
+            "Wait for AWS to complete the restore, then rerun this script."
+        )
+    else:
+        print(
+            "Use --auto-request-restore to automatically submit restore requests "
+            "for cold Glacier/Deep Archive objects, or restore them manually, then "
+            "rerun this script once they are ready."
+        )
+
+    # Exit without doing any downloads
+    sys.exit(1)
+
 
 # ---------- Core Operations ----------
 
@@ -255,23 +377,12 @@ def download_tar_from_s3(
     scratch_dir=None,
     expected_size=None,
     verbose=False,
-    auto_request=False,
-    restore_days=7,
-    restore_tier="Standard",
 ):
-    """Download tar from S3 to a temporary file in scratch_dir."""
-    vprint(verbose, f"Preparing to download tar s3://{bucket}/{key}")
+    """Download tar from S3 to a temporary file in scratch_dir.
 
-    # Ensure object is restored (or request restore)
-    resp = ensure_restored_or_request(
-        bucket=bucket,
-        key=key,
-        s3_client=s3_client,
-        auto_request=auto_request,
-        restore_days=restore_days,
-        restore_tier=restore_tier,
-        verbose=verbose,
-    )
+    Assumes preflight_check_objects has already verified that the object is ready.
+    """
+    vprint(verbose, f"Downloading tar s3://{bucket}/{key}")
 
     # Determine tar suffix by key extension (used only for nicer filename)
     if key.endswith(".tar.gz"):
@@ -290,10 +401,7 @@ def download_tar_from_s3(
         f"restore_{uuid.uuid4().hex}{suffix}"
     )
 
-    # Get size for progress bar if not provided
     total_bytes = expected_size
-    if total_bytes is None and resp is not None:
-        total_bytes = resp.get("ContentLength")
 
     progress = DownloadProgressCallback(
         total_bytes or 0,
@@ -328,30 +436,17 @@ def download_file_from_s3(
     s3_client,
     expected_size=None,
     verbose=False,
-    auto_request=False,
-    restore_days=7,
-    restore_tier="Standard",
 ):
-    """Download a single file object from S3 to dest_path."""
-    vprint(verbose, f"Preparing to download file s3://{bucket}/{key} -> {dest_path}")
+    """Download a single file object from S3 to dest_path.
 
-    # Ensure object is restored (or request restore)
-    resp = ensure_restored_or_request(
-        bucket=bucket,
-        key=key,
-        s3_client=s3_client,
-        auto_request=auto_request,
-        restore_days=restore_days,
-        restore_tier=restore_tier,
-        verbose=verbose,
-    )
+    Assumes preflight_check_objects has already verified that the object is ready.
+    """
+    vprint(verbose, f"Downloading file s3://{bucket}/{key} -> {dest_path}")
 
     if dest_path:
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
 
     total_bytes = expected_size
-    if total_bytes is None and resp is not None:
-        total_bytes = resp.get("ContentLength")
 
     progress = DownloadProgressCallback(
         total_bytes or 0,
@@ -420,6 +515,7 @@ def extract_tar(tar_path, restore_root, selected_relpaths=None, verbose=False):
             tar.extract(member, path=restore_root)
 
     vprint(verbose, "Extraction complete.")
+
 
 def verify_restored_files(inventory, restore_root,
                           subset_relpaths=None, verbose=False,
@@ -538,76 +634,37 @@ def verify_restored_files(inventory, restore_root,
     vprint(verbose, "All verified files match expected checksums.")
     return status_map
 
-'''
-def verify_restored_files(inventory, restore_root, subset_relpaths=None, verbose=False):
-    """
-    Verify that each file listed in inventory (optionally subset) has the expected
-    SHA256 after extraction into restore_root.
 
-    For regular files: hash file contents.
-    For symlinks: hash the link target string stored in the symlink.
+def write_summary_csv(inventory, restore_root, subset_relpaths, verify_status,
+                      csv_path, verbose=False):
+    """
+    Write a CSV summary of restored files.
+
+    Columns:
+      relative_path, full_path, size_bytes, verify_status
     """
     files = inventory.get("files", [])
     records_by_rel = {rec["relative_path"]: rec for rec in files}
 
-    if subset_relpaths is not None:
-        target_relpaths = [rp for rp in subset_relpaths if rp in records_by_rel]
-    else:
-        target_relpaths = list(records_by_rel.keys())
+    if subset_relpaths is None:
+        subset_relpaths = set(records_by_rel.keys())
 
-    if not target_relpaths:
-        vprint(verbose, "No files to verify.")
-        return {}
+    os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
 
-    iterator = target_relpaths
-    if verbose and tqdm:
-        iterator = tqdm(target_relpaths, desc="Verify", unit="files")
+    vprint(verbose, f"Writing summary CSV to {csv_path}")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["relative_path", "full_path", "size_bytes", "verify_status"])
 
-    mismatches = []
-    status_map = {}
-
-    for relpath in iterator:
-        rec = records_by_rel[relpath]
-        expected_sha = rec.get("sha256")
-        is_symlink = rec.get("is_symlink", False)
-        full_path = os.path.join(restore_root, relpath)
-
-        if is_symlink:
-            # For symlinks, verify the link itself
-            if not os.path.islink(full_path):
-                status_map[relpath] = "missing"
-                mismatches.append((full_path, "missing"))
+        for rel in sorted(subset_relpaths):
+            rec = records_by_rel.get(rel)
+            if rec is None:
                 continue
-            try:
-                link_target = os.readlink(full_path)
-            except OSError:
-                status_map[relpath] = "missing"
-                mismatches.append((full_path, "missing"))
-                continue
-            actual_sha = hashlib.sha256(link_target.encode("utf-8")).hexdigest()
-        else:
-            # Regular file: check contents
-            if not os.path.isfile(full_path):
-                status_map[relpath] = "missing"
-                mismatches.append((full_path, "missing"))
-                continue
-            actual_sha = compute_sha256(full_path, verbose=verbose)
+            full_path = os.path.join(restore_root, rel)
+            size_bytes = rec.get("size_bytes", "")
+            status = verify_status.get(rel, "not_checked") if verify_status else "not_checked"
+            writer.writerow([rel, full_path, size_bytes, status])
 
-        if actual_sha != expected_sha:
-            status_map[relpath] = "checksum_mismatch"
-            mismatches.append((full_path, "checksum_mismatch"))
-        else:
-            status_map[relpath] = "ok"
-
-    if mismatches:
-        msg_lines = ["Verification FAILED for the following files:"]
-        for path, reason in mismatches:
-            msg_lines.append(f"  {reason}: {path}")
-        raise RuntimeError("\n".join(msg_lines))
-
-    vprint(verbose, "All verified files match expected checksums.")
-    return status_map
-'''
 
 # ---------- Main ----------
 
@@ -662,7 +719,7 @@ def main():
     parser.add_argument(
         "--verify-checksums",
         action="store_true",
-        help="After extraction, recompute SHA256 of each file and compare to inventory."
+        help="After extraction, recompute SHA256 checksums and compare to inventory."
     )
     parser.add_argument(
         "--summary-csv",
@@ -684,7 +741,8 @@ def main():
         action="store_true",
         help=(
             "If an object is in GLACIER / DEEP_ARCHIVE and not yet restored, "
-            "submit a restore request and abort with a message."
+            "submit a restore request up front and exit. Only when all required "
+            "objects are ready will downloads proceed."
         ),
     )
     parser.add_argument(
@@ -780,11 +838,11 @@ def main():
     if args.dry_run:
         print("DRY RUN: no data will be downloaded or written.")
         print(f"  Inventory file: {inv_path}")
-        print(f"  Restore root: {restore_root}")
+        print(f"  Restore root:   {restore_root}")
         print(f"  Files to restore: {len(selected_relpaths)}")
         print(f"  Total bytes (from inventory): {total_bytes}")
         if args.only_path:
-            print(f"  Filters --only-path: {args.only_path}")
+            print(f"  Filters --only-path:   {args.only_path}")
         if args.only_prefix:
             print(f"  Filters --only-prefix: {args.only_prefix}")
 
@@ -807,6 +865,7 @@ def main():
         if args.auto_request_restore:
             print("  (If run without --dry-run, restore requests would be submitted "
                   "for any cold Glacier/Deep Archive objects.)")
+
         sys.exit(0)
 
     # Check restore target
@@ -838,6 +897,17 @@ def main():
             continue
         jobs.append((oid, rels, obj))
 
+    # Preflight check all required objects (Glacier-friendly)
+    preflight_check_objects(
+        bucket=bucket,
+        jobs=jobs,
+        s3_client=s3_client,
+        auto_request=args.auto_request_restore,
+        restore_days=args.restore_days,
+        restore_tier=args.restore_tier,
+        verbose=verbose,
+    )
+
     temp_tars = []
 
     def restore_object_job(oid, rels, obj):
@@ -861,9 +931,6 @@ def main():
                     s3_client,
                     expected_size=obj_size,
                     verbose=verbose,
-                    auto_request=args.auto_request_restore,
-                    restore_days=args.restore_days,
-                    restore_tier=args.restore_tier,
                 )
             return None
 
@@ -876,9 +943,6 @@ def main():
                 scratch_dir=args.scratch_dir,
                 expected_size=obj_size,
                 verbose=verbose,
-                auto_request=args.auto_request_restore,
-                restore_days=args.restore_days,
-                restore_tier=args.restore_tier,
             )
 
             extract_tar(tar_path, restore_root, selected_relpaths=rels, verbose=verbose)
@@ -897,7 +961,6 @@ def main():
             return None
 
     # Parallel restore
-    bucket = bucket  # just to make sure it's in closure
     max_workers = max(1, args.max_workers)
     vprint(verbose, f"Starting restore with up to {max_workers} workers...")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -922,7 +985,6 @@ def main():
             max_workers=max_workers,
         )
     else:
-        # mark all selected as not_checked
         verify_status = {rel: "not_checked" for rel in selected_relpaths}
 
     # Optional summary CSV
@@ -936,8 +998,8 @@ def main():
             verbose=verbose
         )
 
-    # Cleanup tars if kept and then user wants deletion (here keep_tar=True means keep)
-    if args.keep_tar:
+    # If keep-tar was set and some tars were kept, just list them
+    if args.keep_tar and temp_tars:
         vprint(verbose, "Temporary tars kept:")
         for t in temp_tars:
             vprint(verbose, f"  {t}")
