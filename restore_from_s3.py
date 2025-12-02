@@ -1004,7 +1004,7 @@ def main():
         for t in temp_tars:
             vprint(verbose, f"  {t}")
 
-    vprint(verbose, "Restore completed successfully.")
+    print("Restore completed successfully.")
 
 
 if __name__ == "__main__":
