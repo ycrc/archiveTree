@@ -92,8 +92,61 @@ def get_owner(stat_result):
     except Exception:
         return str(stat_result.st_uid)
 
-def build_inventory(root_dir, verbose=False):
-    """Walk directory and compute inventory."""
+def _checksum_one(path, root_dir, verbose=False):
+    """
+    Compute the inventory record for a single path.
+
+    Returns (record, path) on success, or (None, path) if the file vanished.
+    Designed to be called from a thread pool.
+    """
+    root_dir = os.path.abspath(root_dir)
+    relpath = os.path.relpath(path, root_dir)
+
+    # Use lstat so we see the symlink itself, not the target
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None, path
+
+    if stat.S_ISLNK(st.st_mode):
+        # Symlink (possibly broken). Hash the link target string.
+        try:
+            link_target = os.readlink(path)
+        except OSError as e:
+            vprint(verbose, f"WARNING: failed to readlink({path}): {e}")
+            link_target = ""
+
+        sha = hashlib.sha256(link_target.encode("utf-8")).hexdigest()
+        record = {
+            "relative_path": relpath,
+            "absolute_path": path,
+            "size_bytes": st.st_size,      # length of link target string
+            "ctime": datetime.fromtimestamp(st.st_ctime).isoformat(),
+            "owner": get_owner(st),
+            "sha256": sha,
+            "is_symlink": True,
+            "symlink_target": link_target,
+        }
+    else:
+        # Regular file (or other non-symlink); hash contents.
+        # Suppress per-file tqdm bars when running in parallel to avoid
+        # interleaved output; the outer progress bar covers overall progress.
+        sha = compute_sha256(path, verbose=verbose, use_tqdm=False)
+        record = {
+            "relative_path": relpath,
+            "absolute_path": path,
+            "size_bytes": st.st_size,
+            "ctime": datetime.fromtimestamp(st.st_ctime).isoformat(),
+            "owner": get_owner(st),
+            "sha256": sha,
+            "is_symlink": False,
+        }
+
+    return record, path
+
+
+def build_inventory(root_dir, verbose=False, max_workers=1):
+    """Walk directory and compute inventory, hashing files in parallel."""
     file_records = []
     file_paths = []
 
@@ -102,57 +155,37 @@ def build_inventory(root_dir, verbose=False):
         for name in filenames:
             file_list.append(os.path.join(dirpath, name))
 
-    iterator = file_list
-    if verbose and tqdm:
-        iterator = tqdm(file_list, desc="Inventory", unit="files")
-
     root_dir = os.path.abspath(root_dir)
 
-    for path in iterator:
-        relpath = os.path.relpath(path, root_dir)
+    vprint(verbose, f"Computing checksums with up to {max_workers} workers "
+                    f"({len(file_list)} files)...")
 
-        # Use lstat so we see the symlink itself, not the target
-        try:
-            st = os.lstat(path)
-        except FileNotFoundError:
-            # File disappeared between walk and lstat; skip with a warning
-            vprint(verbose, f"WARNING: {path} vanished during inventory; skipping.")
-            continue
+    pbar = None
+    if verbose and tqdm:
+        pbar = tqdm(total=len(file_list), desc="Inventory", unit="files")
 
-        if stat.S_ISLNK(st.st_mode):
-            # Symlink (possibly broken). Hash the link target string.
-            try:
-                link_target = os.readlink(path)
-            except OSError as e:
-                vprint(verbose, f"WARNING: failed to readlink({path}): {e}")
-                link_target = ""
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_checksum_one, path, root_dir, verbose): path
+            for path in file_list
+        }
+        for fut in as_completed(futures):
+            record, path = fut.result()
+            if record is None:
+                vprint(verbose, f"WARNING: {path} vanished during inventory; skipping.")
+            else:
+                file_records.append(record)
+                file_paths.append(path)
+            if pbar:
+                pbar.update(1)
 
-            sha = hashlib.sha256(link_target.encode("utf-8")).hexdigest()
-            record = {
-                "relative_path": relpath,
-                "absolute_path": path,
-                "size_bytes": st.st_size,      # length of link target string
-                "ctime": datetime.fromtimestamp(st.st_ctime).isoformat(),
-                "owner": get_owner(st),
-                "sha256": sha,
-                "is_symlink": True,
-                "symlink_target": link_target,
-            }
-        else:
-            # Regular file (or other non-symlink); hash contents
-            sha = compute_sha256(path, verbose=verbose)
-            record = {
-                "relative_path": relpath,
-                "absolute_path": path,
-                "size_bytes": st.st_size,
-                "ctime": datetime.fromtimestamp(st.st_ctime).isoformat(),
-                "owner": get_owner(st),
-                "sha256": sha,
-                "is_symlink": False,
-            }
+    if pbar:
+        pbar.close()
 
-        file_records.append(record)
-        file_paths.append(path)
+    # Restore original filesystem order (os.walk order) for determinism.
+    walk_order = {p: i for i, p in enumerate(file_list)}
+    file_records.sort(key=lambda r: walk_order.get(r["absolute_path"], 0))
+    file_paths.sort(key=lambda p: walk_order.get(p, 0))
 
     inventory = {
         "inventory_id": str(uuid.uuid4()),
@@ -377,6 +410,14 @@ def main():
         action="store_true",
         help="Show what would be uploaded, but do not create tars, upload, or delete anything.",
     )
+    parser.add_argument(
+        "--inventory-dir",
+        default=None,
+        help=(
+            "Directory in which to write the local inventory JSON file. "
+            "Defaults to the parent of the archived directory."
+        ),
+    )
 
     parser.add_argument(
         "--no-summary",
@@ -394,8 +435,28 @@ def main():
         print(f"ERROR: {root_dir} is not a directory", file=sys.stderr)
         sys.exit(1)
 
+    # Resolve and verify the inventory output directory early, before doing
+    # any real work, so we don't fail after a long upload.
+    if args.inventory_dir is not None:
+        inv_dir = os.path.abspath(args.inventory_dir)
+        if not os.path.isdir(inv_dir):
+            print(f"ERROR: --inventory-dir {inv_dir} is not a directory",
+                  file=sys.stderr)
+            sys.exit(1)
+    else:
+        inv_dir = os.path.dirname(root_dir)
+
+    if not os.access(inv_dir, os.W_OK):
+        print(
+            f"ERROR: inventory directory {inv_dir!r} is not writable. "
+            "Use --inventory-dir to specify a writable location.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     vprint(verbose, "Building inventory...")
-    inventory, _ = build_inventory(root_dir, verbose=verbose)
+    inventory, _ = build_inventory(root_dir, verbose=verbose,
+                                   max_workers=args.max_workers)
 
     # Partition files into large and small sets
     size_cutoff = args.size_cutoff
@@ -586,10 +647,9 @@ def main():
             obj_meta = fut.result()
             objects.append(obj_meta)
 
-    # Inventory file path in parent directory
-    parent = os.path.dirname(root_dir)
+    # Inventory file path – use --inventory-dir if given, else parent of root_dir
     invname = f"{base_name}.inventory.{inventory['inventory_id']}.json"
-    invpath = os.path.join(parent, invname)
+    invpath = os.path.join(inv_dir, invname)
 
     # Always write the inventory file locally, once uploads have succeeded
     write_inventory_file(inventory, args.bucket, objects, invpath, verbose=verbose)
