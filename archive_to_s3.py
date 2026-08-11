@@ -29,19 +29,20 @@ Parallel:
 import argparse
 import os
 import sys
-import tarfile
-import tempfile
 import shutil
-import hashlib
-import json
-import uuid
-import pwd
-import stat
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 from botocore.exceptions import ClientError
+
+from archive_common import (
+    vprint,
+    build_inventory,
+    create_tar,
+    partition_by_size,
+    group_small_files,
+    write_inventory_file,
+)
 
 # Optional tqdm for progress bars
 try:
@@ -50,183 +51,6 @@ except ImportError:
     tqdm = None
 
 GLACIER_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"}
-
-
-# ---------- Utility Functions ----------
-
-def vprint(verbose, *args, **kwargs):
-    """Print only if verbose."""
-    if verbose:
-        print(*args, **kwargs)
-
-
-def compute_sha256(path, verbose=False, use_tqdm=True):
-    """Compute SHA256 checksum of a file with optional progress bar."""
-    filesize = os.path.getsize(path)
-    h = hashlib.sha256()
-
-    show_bar = verbose and tqdm and use_tqdm
-    pbar = tqdm(total=filesize, unit="B", unit_scale=True,
-                desc=f"hash {os.path.basename(path)}") if show_bar else None
-
-    chunk_size = 8 * 1024 * 1024
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            h.update(chunk)
-            if pbar:
-                pbar.update(len(chunk))
-
-    if pbar:
-        pbar.close()
-
-    return h.hexdigest()
-
-
-def get_owner(stat_result):
-    """Get username from stat, fall back to uid."""
-    try:
-        return pwd.getpwuid(stat_result.st_uid).pw_name
-    except Exception:
-        return str(stat_result.st_uid)
-
-def _checksum_one(path, root_dir, verbose=False):
-    """
-    Compute the inventory record for a single path.
-
-    Returns (record, path) on success, or (None, path) if the file vanished.
-    Designed to be called from a thread pool.
-    """
-    root_dir = os.path.abspath(root_dir)
-    relpath = os.path.relpath(path, root_dir)
-
-    # Use lstat so we see the symlink itself, not the target
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return None, path
-
-    if stat.S_ISLNK(st.st_mode):
-        # Symlink (possibly broken). Hash the link target string.
-        try:
-            link_target = os.readlink(path)
-        except OSError as e:
-            vprint(verbose, f"WARNING: failed to readlink({path}): {e}")
-            link_target = ""
-
-        sha = hashlib.sha256(link_target.encode("utf-8")).hexdigest()
-        record = {
-            "relative_path": relpath,
-            "absolute_path": path,
-            "size_bytes": st.st_size,      # length of link target string
-            "ctime": datetime.fromtimestamp(st.st_ctime).isoformat(),
-            "owner": get_owner(st),
-            "sha256": sha,
-            "is_symlink": True,
-            "symlink_target": link_target,
-        }
-    else:
-        # Regular file (or other non-symlink); hash contents.
-        # Suppress per-file tqdm bars when running in parallel to avoid
-        # interleaved output; the outer progress bar covers overall progress.
-        sha = compute_sha256(path, verbose=verbose, use_tqdm=False)
-        record = {
-            "relative_path": relpath,
-            "absolute_path": path,
-            "size_bytes": st.st_size,
-            "ctime": datetime.fromtimestamp(st.st_ctime).isoformat(),
-            "owner": get_owner(st),
-            "sha256": sha,
-            "is_symlink": False,
-        }
-
-    return record, path
-
-
-def build_inventory(root_dir, verbose=False, max_workers=1):
-    """Walk directory and compute inventory, hashing files in parallel."""
-    file_records = []
-    file_paths = []
-
-    file_list = []
-    for dirpath, _, filenames in os.walk(root_dir):
-        for name in filenames:
-            file_list.append(os.path.join(dirpath, name))
-
-    root_dir = os.path.abspath(root_dir)
-
-    vprint(verbose, f"Computing checksums with up to {max_workers} workers "
-                    f"({len(file_list)} files)...")
-
-    pbar = None
-    if verbose and tqdm:
-        pbar = tqdm(total=len(file_list), desc="Inventory", unit="files")
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_checksum_one, path, root_dir, verbose): path
-            for path in file_list
-        }
-        for fut in as_completed(futures):
-            record, path = fut.result()
-            if record is None:
-                vprint(verbose, f"WARNING: {path} vanished during inventory; skipping.")
-            else:
-                file_records.append(record)
-                file_paths.append(path)
-            if pbar:
-                pbar.update(1)
-
-    if pbar:
-        pbar.close()
-
-    # Restore original filesystem order (os.walk order) for determinism.
-    walk_order = {p: i for i, p in enumerate(file_list)}
-    file_records.sort(key=lambda r: walk_order.get(r["absolute_path"], 0))
-    file_paths.sort(key=lambda p: walk_order.get(p, 0))
-
-    inventory = {
-        "inventory_id": str(uuid.uuid4()),
-        "root_dir": root_dir,
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "total_files": len(file_records),
-        "total_bytes": sum(r["size_bytes"] for r in file_records),
-        "files": file_records,
-    }
-
-    return inventory, file_paths
-
-
-def create_tar(root_dir, abs_paths, scratch_dir=None, tar_compression=None,
-               verbose=False, group_index=None):
-    """Tar up a subset of files with optional progress bar."""
-    root_dir = os.path.abspath(root_dir)
-    base_name = os.path.basename(root_dir.rstrip(os.sep))
-    suffix = ".tar.gz" if tar_compression == "gz" else ".tar"
-    if scratch_dir is None:
-        scratch_dir = tempfile.gettempdir()
-
-    os.makedirs(scratch_dir, exist_ok=True)
-    if group_index is None:
-        name_part = uuid.uuid4().hex
-    else:
-        name_part = f"group_{group_index:06d}"
-    tar_path = os.path.join(scratch_dir, f"{base_name}_{name_part}{suffix}")
-
-    mode = "w:gz" if tar_compression == "gz" else "w"
-
-    iterator = abs_paths
-    if verbose and tqdm:
-        iterator = tqdm(abs_paths, desc=f"Tar {name_part}", unit="files")
-
-    with tarfile.open(tar_path, mode, dereference=False) as tar:
-        for path in iterator:
-            relpath = os.path.relpath(path, root_dir)
-            tar.add(path, arcname=relpath)
-
-    return tar_path
 
 
 # ---------- S3 + Progress ----------
@@ -322,37 +146,6 @@ def upload_file_to_s3(path, bucket, key, storage_class, s3_client,
                     f"s3://{bucket}/{key} (StorageClass={remote_storage_class}).")
 
     return remote_storage_class, remote_size
-
-
-# ---------- Inventory Writing ----------
-
-def write_inventory_file(inventory, bucket, objects, inventory_path, verbose=False):
-    """
-    Write inventory JSON file to inventory_path.
-
-    `objects` is a list of dicts describing each S3 object, e.g.:
-      {
-        "id": "tar-000001",
-        "type": "tar",
-        "s3_key": "...",
-        "size_bytes": 123,
-        "storage_class": "DEEP_ARCHIVE",
-        "file_count": 42
-      }
-    """
-    inv = dict(inventory)
-    inv["archive"] = {
-        "s3_bucket": bucket,
-        "archive_id": inventory["inventory_id"],
-        "objects": objects,
-    }
-
-    os.makedirs(os.path.dirname(inventory_path), exist_ok=True)
-
-    with open(inventory_path, "w") as f:
-        json.dump(inv, f, indent=2, sort_keys=True)
-
-    vprint(verbose, f"Wrote inventory file {inventory_path}")
 
 
 # ---------- Main ----------
@@ -463,8 +256,7 @@ def main():
     size_grouping = args.size_grouping
     files = inventory["files"]
 
-    large_files = [rec for rec in files if rec["size_bytes"] > size_cutoff]
-    small_files = [rec for rec in files if rec["size_bytes"] <= size_cutoff]
+    large_files, small_files = partition_by_size(files, size_cutoff)
 
     vprint(
         verbose,
@@ -485,20 +277,7 @@ def main():
     s3_client = get_s3_client(args.profile, args.endpoint_url)
 
     # Group small files into tars of approximately size_grouping bytes
-    groups = []
-    current = []
-    current_size = 0
-
-    for rec in small_files:
-        current.append(rec)
-        current_size += rec["size_bytes"]
-        if current_size >= size_grouping:
-            groups.append(current)
-            current = []
-            current_size = 0
-
-    if current:
-        groups.append(current)
+    groups = group_small_files(small_files, size_grouping)
 
     vprint(verbose, f"Created {len(groups)} small-file groups.")
 
@@ -652,7 +431,7 @@ def main():
     invpath = os.path.join(inv_dir, invname)
 
     # Always write the inventory file locally, once uploads have succeeded
-    write_inventory_file(inventory, args.bucket, objects, invpath, verbose=verbose)
+    write_inventory_file(inventory, {"s3_bucket": args.bucket}, objects, invpath, verbose=verbose)
 
     # Also upload the inventory file to S3 using STANDARD storage class,
     # under the same archive prefix, in an "inventory" subdir:

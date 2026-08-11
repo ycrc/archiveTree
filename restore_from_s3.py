@@ -31,15 +31,20 @@ import os
 import sys
 import json
 import uuid
-import hashlib
-import tarfile
 import tempfile
 import shutil
-import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 from botocore.exceptions import ClientError
+
+from archive_common import (
+    vprint,
+    select_relpaths,
+    extract_tar,
+    verify_restored_files,
+    write_summary_csv,
+)
 
 # Optional tqdm for progress bars
 try:
@@ -52,41 +57,6 @@ GLACIER_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"}
 
 
 # ---------- Utility ----------
-
-def vprint(verbose, *args, **kwargs):
-    """Print only if verbose is True."""
-    if verbose:
-        print(*args, **kwargs)
-
-
-def compute_sha256(path, verbose=False, use_tqdm=True):
-    """Compute SHA256 checksum of a file with optional progress bar."""
-    filesize = os.path.getsize(path)
-    h = hashlib.sha256()
-    chunk_size = 8 * 1024 * 1024
-
-    show_bar = verbose and tqdm and use_tqdm
-    pbar = tqdm(
-        total=filesize,
-        unit="B",
-        unit_scale=True,
-        desc=f"hash {os.path.basename(path)}"
-    ) if show_bar else None
-
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            h.update(chunk)
-            if pbar:
-                pbar.update(len(chunk))
-
-    if pbar:
-        pbar.close()
-
-    return h.hexdigest()
-
 
 def get_s3_client(profile=None, endpoint_url=None):
     """Create a boto3 S3 client with optional profile and endpoint."""
@@ -125,36 +95,6 @@ class DownloadProgressCallback:
     def close(self):
         if self._pbar:
             self._pbar.close()
-
-
-def select_relpaths(inventory, only_paths=None, only_prefixes=None, verbose=False):
-    """
-    Determine which relative paths from the inventory to restore,
-    based on --only-path and --only-prefix options.
-    """
-    files = inventory.get("files", [])
-    all_relpaths = [rec["relative_path"] for rec in files]
-    all_set = set(all_relpaths)
-
-    if not only_paths and not only_prefixes:
-        selected = all_set
-    else:
-        selected = set()
-        if only_paths:
-            for p in only_paths:
-                if p in all_set:
-                    selected.add(p)
-                else:
-                    vprint(verbose, f"WARNING: --only-path '{p}' not found in inventory.")
-        if only_prefixes:
-            for pref in only_prefixes:
-                matched = [rp for rp in all_relpaths if rp.startswith(pref)]
-                if not matched:
-                    vprint(verbose, f"WARNING: --only-prefix '{pref}' matched no files.")
-                selected.update(matched)
-
-    vprint(verbose, f"Selected {len(selected)} of {len(all_relpaths)} files from inventory.")
-    return selected
 
 
 # ---------- Glacier / Deep Archive Helpers ----------
@@ -470,200 +410,6 @@ def download_file_from_s3(
             )
 
     vprint(verbose, f"File download complete: {dest_path}")
-
-
-def extract_tar(tar_path, restore_root, selected_relpaths=None, verbose=False):
-    """
-    Extract tar into restore_root.
-
-    If selected_relpaths is not None (set of relative file paths),
-    only those files (and needed directories) are extracted.
-    """
-    if tar_path.endswith(".tar.gz"):
-        mode = "r:gz"
-    else:
-        mode = "r"
-
-    vprint(verbose, f"Extracting {tar_path} into {restore_root} ...")
-
-    if selected_relpaths is not None:
-        selected_relpaths = set(selected_relpaths)
-
-    with tarfile.open(tar_path, mode) as tar:
-        members = tar.getmembers()
-        iterator = members
-        if verbose and tqdm:
-            iterator = tqdm(members, desc="Extract", unit="files")
-
-        for member in iterator:
-            name = member.name
-
-            if selected_relpaths is not None:
-                if member.isdir():
-                    # Extract directory only if any selected file is under it
-                    dir_name = name.rstrip("/")
-                    needed = any(
-                        (rp == dir_name) or rp.startswith(dir_name + "/")
-                        for rp in selected_relpaths
-                    )
-                    if not needed:
-                        continue
-                else:
-                    if name not in selected_relpaths:
-                        continue
-
-            tar.extract(member, path=restore_root)
-
-    vprint(verbose, "Extraction complete.")
-
-
-def verify_restored_files(inventory, restore_root,
-                          subset_relpaths=None, verbose=False,
-                          max_workers=1):
-    """
-    Verify that each file listed in inventory (optionally subset) has the expected
-    SHA256 after extraction into restore_root.
-
-    For regular files: hash file contents.
-    For symlinks (is_symlink=True): hash the link target string.
-
-    Returns:
-        status_map: dict[relative_path] -> status string
-                    ("ok", "missing", "checksum_mismatch")
-
-    Raises:
-        RuntimeError if any file is missing or mismatched.
-    """
-    files = inventory.get("files", [])
-    records_by_rel = {rec["relative_path"]: rec for rec in files}
-
-    if subset_relpaths is not None:
-        target_relpaths = [rp for rp in subset_relpaths if rp in records_by_rel]
-    else:
-        target_relpaths = list(records_by_rel.keys())
-
-    if not target_relpaths:
-        vprint(verbose, "No files to verify.")
-        return {}
-
-    status_map = {}
-    mismatches = []
-
-    # ---------- single-threaded path (keep tqdm behavior) ----------
-    if max_workers <= 1:
-        iterator = target_relpaths
-        if verbose and tqdm:
-            iterator = tqdm(target_relpaths, desc="Verify", unit="files")
-
-        for relpath in iterator:
-            rec = records_by_rel[relpath]
-            expected_sha = rec.get("sha256")
-            is_symlink = rec.get("is_symlink", False)
-            full_path = os.path.join(restore_root, relpath)
-
-            if is_symlink:
-                # verify the symlink itself
-                if not os.path.islink(full_path):
-                    status_map[relpath] = "missing"
-                    mismatches.append((full_path, "missing"))
-                    continue
-                try:
-                    link_target = os.readlink(full_path)
-                except OSError:
-                    status_map[relpath] = "missing"
-                    mismatches.append((full_path, "missing"))
-                    continue
-                actual_sha = hashlib.sha256(link_target.encode("utf-8")).hexdigest()
-            else:
-                # regular file
-                if not os.path.isfile(full_path):
-                    status_map[relpath] = "missing"
-                    mismatches.append((full_path, "missing"))
-                    continue
-                actual_sha = compute_sha256(full_path, verbose=verbose)
-
-            if actual_sha != expected_sha:
-                status_map[relpath] = "checksum_mismatch"
-                mismatches.append((full_path, "checksum_mismatch"))
-            else:
-                status_map[relpath] = "ok"
-
-    # ---------- parallel path ----------
-    else:
-        def verify_one(relpath):
-            rec = records_by_rel[relpath]
-            expected_sha = rec.get("sha256")
-            is_symlink = rec.get("is_symlink", False)
-            full_path = os.path.join(restore_root, relpath)
-
-            if is_symlink:
-                if not os.path.islink(full_path):
-                    return relpath, "missing"
-                try:
-                    link_target = os.readlink(full_path)
-                except OSError:
-                    return relpath, "missing"
-                actual_sha = hashlib.sha256(link_target.encode("utf-8")).hexdigest()
-            else:
-                if not os.path.isfile(full_path):
-                    return relpath, "missing"
-                # no per-file tqdm in parallel mode
-                actual_sha = compute_sha256(full_path, verbose=False, use_tqdm=False)
-
-            if actual_sha != expected_sha:
-                return relpath, "checksum_mismatch"
-            else:
-                return relpath, "ok"
-
-        vprint(verbose, f"Verifying {len(target_relpaths)} files with {max_workers} workers...")
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(verify_one, rel): rel for rel in target_relpaths}
-            for fut in as_completed(futures):
-                relpath, status = fut.result()
-                status_map[relpath] = status
-                if status != "ok":
-                    full_path = os.path.join(restore_root, relpath)
-                    mismatches.append((full_path, status))
-
-    if mismatches:
-        msg_lines = ["Verification FAILED for the following files:"]
-        for path, reason in mismatches:
-            msg_lines.append(f"  {reason}: {path}")
-        raise RuntimeError("\n".join(msg_lines))
-
-    vprint(verbose, "All verified files match expected checksums.")
-    return status_map
-
-
-def write_summary_csv(inventory, restore_root, subset_relpaths, verify_status,
-                      csv_path, verbose=False):
-    """
-    Write a CSV summary of restored files.
-
-    Columns:
-      relative_path, full_path, size_bytes, verify_status
-    """
-    files = inventory.get("files", [])
-    records_by_rel = {rec["relative_path"]: rec for rec in files}
-
-    if subset_relpaths is None:
-        subset_relpaths = set(records_by_rel.keys())
-
-    os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
-
-    vprint(verbose, f"Writing summary CSV to {csv_path}")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["relative_path", "full_path", "size_bytes", "verify_status"])
-
-        for rel in sorted(subset_relpaths):
-            rec = records_by_rel.get(rel)
-            if rec is None:
-                continue
-            full_path = os.path.join(restore_root, rel)
-            size_bytes = rec.get("size_bytes", "")
-            status = verify_status.get(rel, "not_checked") if verify_status else "not_checked"
-            writer.writerow([rel, full_path, size_bytes, status])
 
 
 # ---------- Main ----------
