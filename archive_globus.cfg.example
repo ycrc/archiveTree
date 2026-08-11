@@ -1,0 +1,37 @@
+# Example config for archive_to_globus.py / restore_from_globus.py.
+#
+# Copy to ~/.archive_globus.cfg (or point --config-file / $GLOBUS_ARCHIVE_CONFIG
+# at a copy elsewhere) and fill in real values.
+#
+# Precedence for every value below: CLI flag > environment variable > this
+# file. Environment variable names are noted in each comment.
+
+[globus]
+# Globus Native App client ID, registered at
+# https://app.globus.org/settings/developers. Do not reuse Globus's shared
+# public tutorial client ID for real archiving runs.
+# Env var: GLOBUS_ARCHIVE_CLIENT_ID
+client_id = <native-app-client-id>
+
+# Where to cache the Globus login refresh token after the first interactive
+# login. Env var: GLOBUS_ARCHIVE_TOKEN_CACHE
+token_cache = ~/.globus_archive_tokens.json
+
+# The Globus collection mapped to this machine's filesystem, and the local
+# path corresponding to that collection's root. Used as the "source" side
+# when archiving, and the "destination" side when restoring.
+# Env vars: GLOBUS_ARCHIVE_SOURCE_COLLECTION / GLOBUS_ARCHIVE_SOURCE_MOUNT
+source_collection = <uuid>
+source_mount = /gpfs/gibbs
+
+# The Globus collection where archives are stored, and a base path within
+# it under which archive objects are placed.
+# Env vars: GLOBUS_ARCHIVE_DEST_COLLECTION / GLOBUS_ARCHIVE_DEST_PATH
+dest_collection = <uuid>
+dest_path = archive
+
+# Optional: override for the collection holding already-archived objects,
+# used by restore_from_globus.py's --archive-collection. Normally this is
+# read from the inventory file itself and does not need to be set here.
+# Env var: GLOBUS_ARCHIVE_ARCHIVE_COLLECTION
+# archive_collection = <uuid>
