@@ -18,7 +18,10 @@ def load_config_file(path):
     """Return the [globus] section of an INI config file as a dict (possibly empty)."""
     if not path or not os.path.isfile(path):
         return {}
-    parser = configparser.ConfigParser()
+    # inline_comment_prefixes lets "key = value # comment" work; safe here
+    # since none of our values (UUIDs, filesystem paths) legitimately
+    # contain '#'.
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#",))
     parser.read(path)
     if "globus" not in parser:
         return {}
