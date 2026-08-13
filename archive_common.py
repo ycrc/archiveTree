@@ -90,7 +90,12 @@ def _checksum_one(path, root_dir, verbose=False):
     try:
         st = os.lstat(path)
     except FileNotFoundError:
-        return None, path
+        return None, path, "vanished"
+
+    if not stat.S_ISLNK(st.st_mode) and not stat.S_ISREG(st.st_mode):
+        # Sockets, FIFOs, device files, etc. can't be meaningfully archived
+        # (open() fails on them, e.g. OSError: No such device or address).
+        return None, path, "not a regular file or symlink"
 
     if stat.S_ISLNK(st.st_mode):
         # Symlink (possibly broken). Hash the link target string.
@@ -126,7 +131,7 @@ def _checksum_one(path, root_dir, verbose=False):
             "is_symlink": False,
         }
 
-    return record, path
+    return record, path, None
 
 
 def build_inventory(root_dir, verbose=False, max_workers=1):
@@ -154,9 +159,9 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
             for path in file_list
         }
         for fut in as_completed(futures):
-            record, path = fut.result()
+            record, path, skip_reason = fut.result()
             if record is None:
-                vprint(verbose, f"WARNING: {path} vanished during inventory; skipping.")
+                vprint(verbose, f"WARNING: skipping {path}: {skip_reason}.")
             else:
                 file_records.append(record)
                 file_paths.append(path)

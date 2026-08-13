@@ -83,7 +83,10 @@ def main():
     parser.add_argument("--scratch-dir", default=None,
                         help="Directory for locally-built tars; must be under --source-mount.")
     parser.add_argument("--compression", choices=["none", "gz"], default="none")
-    parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--delete", action="store_true",
+        help="Delete the source directory tree after a successful archive. Default: keep it.",
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
         "--size-cutoff", type=int, default=1_000_000_000,
@@ -326,12 +329,17 @@ def main():
                 label=f"archive {base_name} {archive_id} batch{batch_num}",
                 verify_checksum=verify_checksum,
             )
+            batch_bytes = sum(
+                j["rec"]["size_bytes"] if j["kind"] == "file" else j["tar_size"]
+                for j in batch
+            )
             for job in batch:
                 add_item_for_job(transfer_data, job)
 
             task = globus_transfer.submit_and_wait(
                 transfer_client, transfer_data, client_id=client_id,
                 token_cache=token_cache, verbose=verbose, poll_interval=args.poll_interval,
+                total_bytes=batch_bytes, desc=f"Transfer batch{batch_num}",
             )
             task_ids.append(task["task_id"])
 
@@ -425,16 +433,10 @@ def main():
     )
 
     # Now (optionally) delete the original directory tree
-    if not args.force:
-        resp = input(
-            f"\nAll transfers and inventory writes completed. "
-            f"About to DELETE directory tree:\n  {root_dir}\n"
-            f"Type 'yes' to proceed, anything else to keep it: "
-        ).strip()
-        if resp.lower() != "yes":
-            print("User declined delete. Original directory left intact. "
-                  "Inventory is available locally and on the Globus collection.")
-            return
+    if not args.delete:
+        print("Source directory left intact (pass --delete to remove it). "
+              "Inventory is available locally and on the Globus collection.")
+        return
 
     vprint(verbose, f"Removing directory tree {root_dir}")
     shutil.rmtree(root_dir)

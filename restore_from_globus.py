@@ -349,6 +349,7 @@ def main():
                 label=f"restore {os.path.basename(restore_root)} batch{batch_num}",
                 verify_checksum=True,
             )
+            batch_bytes = sum(obj["size_bytes"] for oid, rels, obj in batch)
             for oid, rels, obj in batch:
                 if oid not in local_paths:
                     continue
@@ -364,6 +365,7 @@ def main():
             globus_transfer.submit_and_wait(
                 transfer_client, transfer_data, client_id=client_id,
                 token_cache=token_cache, verbose=verbose, poll_interval=args.poll_interval,
+                total_bytes=batch_bytes, desc=f"Transfer batch{batch_num}",
             )
 
         # Extract tars locally (parallel, CPU/disk-bound local work).

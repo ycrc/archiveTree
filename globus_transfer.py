@@ -11,6 +11,12 @@ import globus_sdk
 
 import globus_auth
 
+# Optional tqdm for progress bars
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 
 def _is_under(path, mount_prefix):
     """True if abspath `path` is mount_prefix itself or lies beneath it."""
@@ -81,7 +87,8 @@ def new_transfer(transfer_client, source_collection, destination_collection, lab
 
 def submit_and_wait(transfer_client, transfer_data, client_id=None,
                      token_cache=globus_auth.DEFAULT_TOKEN_CACHE,
-                     verbose=False, poll_interval=15):
+                     verbose=False, poll_interval=15,
+                     total_bytes=None, desc=None):
     """
     Submit a TransferData task and block until it completes.
 
@@ -89,6 +96,10 @@ def submit_and_wait(transfer_client, transfer_data, client_id=None,
     additionally required scopes, builds a fresh TransferClient from the
     updated token cache, and retries submission once with that client
     (which is also used for the subsequent polling below).
+
+    If verbose, tqdm is installed, and total_bytes is given, shows a
+    tqdm progress bar driven by the task's cumulative bytes_transferred
+    instead of printing a status line per poll.
 
     Returns the final task document (dict-like GlobusHTTPResponse).
     Raises RuntimeError if the task does not succeed.
@@ -121,17 +132,37 @@ def submit_and_wait(transfer_client, transfer_data, client_id=None,
     if verbose:
         print(f"Submitted Globus transfer task_id={task_id}")
 
-    while not transfer_client.task_wait(task_id, timeout=poll_interval,
-                                         polling_interval=poll_interval):
-        if verbose:
-            task = transfer_client.get_task(task_id)
+    pbar = None
+    last_bytes = 0
+    if verbose and tqdm and total_bytes:
+        pbar = tqdm(total=total_bytes, unit="B", unit_scale=True, desc=desc or "Transfer")
+
+    def _update_progress():
+        nonlocal last_bytes
+        task = transfer_client.get_task(task_id)
+        if pbar:
+            bytes_transferred = task.get("bytes_transferred") or 0
+            pbar.update(bytes_transferred - last_bytes)
+            last_bytes = bytes_transferred
+            pbar.set_postfix(files=task.get("files_transferred"))
+        elif verbose:
             print(
                 f"  [{task_id}] status={task['status']} "
                 f"bytes_transferred={task.get('bytes_transferred')} "
                 f"files_transferred={task.get('files_transferred')}"
             )
+        return task
 
-    task = transfer_client.get_task(task_id)
+    while not transfer_client.task_wait(task_id, timeout=poll_interval,
+                                         polling_interval=poll_interval):
+        if verbose:
+            _update_progress()
+
+    task = _update_progress() if verbose else transfer_client.get_task(task_id)
+
+    if pbar:
+        pbar.close()
+
     if task["status"] != "SUCCEEDED":
         raise RuntimeError(
             f"Globus transfer task {task_id} finished with status "

@@ -170,7 +170,10 @@ def main():
     )
     parser.add_argument("--scratch-dir", default=None)
     parser.add_argument("--compression", choices=["none", "gz"], default="none")
-    parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--delete", action="store_true",
+        help="Delete the source directory tree after a successful archive. Default: keep it.",
+    )
     parser.add_argument("--profile", default=None)
     parser.add_argument("--endpoint-url", default=None)
     parser.add_argument("--verbose", action="store_true")
@@ -452,16 +455,10 @@ def main():
     )
 
     # Now (optionally) delete the original directory tree
-    if not args.force:
-        resp = input(
-            f"\nAll uploads and inventory writes completed. "
-            f"About to DELETE directory tree:\n  {root_dir}\n"
-            f"Type 'yes' to proceed, anything else to keep it: "
-        ).strip()
-        if resp.lower() != "yes":
-            print("User declined delete. Original directory left intact. "
-                  "Inventory is available locally and in S3.")
-            return
+    if not args.delete:
+        print("Source directory left intact (pass --delete to remove it). "
+              "Inventory is available locally and in S3.")
+        return
 
     vprint(verbose, f"Removing directory tree {root_dir}")
     shutil.rmtree(root_dir)
