@@ -13,13 +13,16 @@ Navigation:
   right/Enter          enter directory
   left/backspace       go up to parent
   space                toggle mark on the highlighted file/directory
-  M                    toggle mark on the directory you're currently inside
   s                    cycle sort mode (name, size-desc/asc, count-desc/asc)
   v                    toggle --verbose in the generated restore script
   c                    clear all marks
   w                    write a restore script for the marked items
   d                    debug: list the archive objects (and sizes) needed for the current selection
   x/Esc                exit (offers to write a restore script first if anything is marked)
+
+The root directory's listing has a synthetic "[ALL]" entry at the top;
+marking it selects the entire tree (equivalent to marking every top-level
+entry, but in one keystroke).
 
 Marking a directory selects its entire subtree; marking is not required on
 descendants of an already-marked directory (they're covered automatically,
@@ -42,7 +45,7 @@ SORT_MODES = ["name", "size-desc", "size-asc", "count-desc", "count-asc"]
 # ---------- Tree model ----------
 
 class Node:
-    __slots__ = ("name", "relpath", "is_dir", "size_bytes", "file_count", "is_symlink", "children")
+    __slots__ = ("name", "relpath", "is_dir", "size_bytes", "file_count", "is_symlink", "is_all", "children")
 
     def __init__(self, name, relpath, is_dir):
         self.name = name
@@ -51,6 +54,7 @@ class Node:
         self.size_bytes = 0
         self.file_count = 0
         self.is_symlink = False
+        self.is_all = False
         self.children = {} if is_dir else None
 
 
@@ -388,7 +392,14 @@ class App:
 
     def current_children(self):
         node = self.path_stack[-1]
-        return sorted(node.children.values(), key=sort_key_for(self.sort_mode))
+        children = sorted(node.children.values(), key=sort_key_for(self.sort_mode))
+        if node is self.root:
+            all_node = Node(name="[ALL]", relpath="", is_dir=True)
+            all_node.size_bytes = self.root.size_bytes
+            all_node.file_count = self.root.file_count
+            all_node.is_all = True
+            children = [all_node] + children
+        return children
 
     def run(self):
         curses.curs_set(0)
@@ -431,8 +442,6 @@ class App:
             self.go_up()
         elif ch == ord(" "):
             self.toggle_mark(children)
-        elif ch == ord("M"):
-            self.toggle_mark_current_dir()
         elif ch == ord("s"):
             self.sort_mode_idx = (self.sort_mode_idx + 1) % len(SORT_MODES)
         elif ch == ord("v"):
@@ -471,7 +480,7 @@ class App:
         if not children:
             return
         node = children[self.cursor_stack[-1]]
-        if node.is_dir:
+        if node.is_dir and not node.is_all:
             self.path_stack.append(node)
             self.cursor_stack.append(0)
             self.scroll_stack.append(0)
@@ -490,15 +499,6 @@ class App:
             del self.marks[node.relpath]
         else:
             self.marks[node.relpath] = "dir" if node.is_dir else "file"
-        self._summary_cache = None
-
-    def toggle_mark_current_dir(self):
-        node = self.path_stack[-1]
-        if node.relpath in self.marks:
-            del self.marks[node.relpath]
-            self._summary_cache = None
-        else:
-            self.marks[node.relpath] = "dir"
         self._summary_cache = None
 
     def write_script_flow(self):
@@ -583,14 +583,14 @@ class App:
                 mark_char = " "
             size_str = format_size(child.size_bytes)
             count_str = str(child.file_count) if child.is_dir else ""
-            suffix = "/" if child.is_dir else ("@" if child.is_symlink else "")
+            suffix = "/" if child.is_dir and not child.is_all else ("@" if child.is_symlink else "")
             line = f"{mark_char} {size_str:>10} {count_str:>8}  {child.name}{suffix}"
             attr = curses.A_REVERSE if i == cursor else curses.A_NORMAL
             stdscr.addnstr(row + 2, 0, line[:width - 1], width - 1, attr)
 
         status = self.message or (
             f"{len(children)} entries | sort:{self.sort_mode} | "
-            "x:exit  jk/updown:nav  Enter:open  left/bksp:up  space:mark  M:mark-this-dir  "
+            "x:exit  jk/updown:nav  Enter:open  left/bksp:up  space:mark  "
             "c:clear  s:sort  v:verbose  w:write script  d:debug objects"
         )
         stdscr.addnstr(height - 1, 0, status[:width - 1], width - 1, curses.A_REVERSE)
