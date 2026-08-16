@@ -471,6 +471,36 @@ def write_summary_csv(inventory, restore_root, subset_relpaths, verify_status,
             writer.writerow([rel, full_path, size_bytes, status])
 
 
+# ---------- Inventory Versioning ----------
+
+# Schema version stamped into every newly written inventory file's
+# top-level "format_version" key. Bump this (and add the new value to
+# SUPPORTED_INVENTORY_VERSIONS) any time the top-level inventory JSON
+# schema changes in a way readers need to know about.
+CURRENT_INVENTORY_VERSION = 2
+
+# Versions this codebase's readers know how to handle. Inventory files
+# written before this versioning scheme existed have no "format_version"
+# key at all; check_inventory_version() treats that as version 1.
+SUPPORTED_INVENTORY_VERSIONS = (1, 2)
+
+
+def check_inventory_version(inventory):
+    """
+    Return an error string if inventory["format_version"] (default 1 if
+    absent) is not supported, else None.
+    """
+    version = inventory.get("format_version", 1)
+    if version not in SUPPORTED_INVENTORY_VERSIONS:
+        return (
+            f"Inventory file has format_version={version!r}, which this "
+            f"version of archiveTree does not support "
+            f"(supported: {SUPPORTED_INVENTORY_VERSIONS}). "
+            "You may need a newer version of archiveTree to read this file."
+        )
+    return None
+
+
 # ---------- Inventory Writing ----------
 
 def write_inventory_file(inventory, backend_meta, objects, inventory_path, verbose=False):
@@ -494,6 +524,7 @@ def write_inventory_file(inventory, backend_meta, objects, inventory_path, verbo
       }
     """
     inv = dict(inventory)
+    inv["format_version"] = CURRENT_INVENTORY_VERSION
     inv["archive"] = {
         **backend_meta,
         "archive_id": inventory["inventory_id"],

@@ -41,6 +41,7 @@ from archive_common import (
     extract_tar,
     verify_restored_files,
     write_summary_csv,
+    check_inventory_version,
 )
 
 
@@ -164,6 +165,11 @@ def main():
     vprint(verbose, f"Loading inventory from {inv_path}")
     with open(inv_path, "r", encoding="utf-8") as f:
         inventory = json.load(f)
+
+    version_error = check_inventory_version(inventory)
+    if version_error:
+        print(f"ERROR: {version_error}", file=sys.stderr)
+        sys.exit(1)
 
     archive = inventory.get("archive")
     if not archive:

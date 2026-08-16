@@ -29,6 +29,8 @@ import sys
 import boto3
 from botocore.exceptions import ClientError
 
+from archive_common import check_inventory_version
+
 GLACIER_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"}
 
 
@@ -157,6 +159,11 @@ def main():
     # Load inventory
     with open(inv_path, "r", encoding="utf-8") as f:
         inventory = json.load(f)
+
+    version_error = check_inventory_version(inventory)
+    if version_error:
+        print(f"ERROR: {version_error}", file=sys.stderr)
+        sys.exit(1)
 
     archive = inventory.get("archive")
     if not archive:
