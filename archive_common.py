@@ -573,7 +573,9 @@ def write_inventory_file(inventory, backend_meta, objects, inventory_path, verbo
         "objects": objects,
     }
 
-    os.makedirs(os.path.dirname(inventory_path), exist_ok=True)
+    inventory_dir = os.path.dirname(inventory_path)
+    if inventory_dir:
+        os.makedirs(inventory_dir, exist_ok=True)
 
     with open(inventory_path, "w") as f:
         json.dump(inv, f, indent=2, sort_keys=True)
