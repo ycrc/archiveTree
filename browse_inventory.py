@@ -150,6 +150,63 @@ def compute_restore_selection(marks):
     return kept_dirs, kept_files, False
 
 
+def compute_summary(inventory, marks):
+    """
+    Return {"restore_count", "restore_bytes", "archive_files", "archive_bytes"}
+    for the current selection:
+
+    - restore_count/restore_bytes: files that will actually be written to
+      disk (the resolved, deduplicated selection from compute_restore_selection).
+    - archive_files/archive_bytes: files that must be read from the archive
+      to satisfy that restore. This can be larger than the restore totals,
+      because restoring even one file out of a shared tar group (see
+      archive_to_s3.py/archive_to_globus.py's small-file grouping) requires
+      downloading the entire group.
+    """
+    if not marks:
+        return {"restore_count": 0, "restore_bytes": 0, "archive_files": 0, "archive_bytes": 0}
+
+    file_records = inventory.get("files", [])
+    objects_by_id = {obj["id"]: obj for obj in (inventory.get("archive") or {}).get("objects", [])}
+
+    dir_prefixes, file_paths, whole_tree = compute_restore_selection(marks)
+
+    if whole_tree:
+        restore_count = inventory.get("total_files", len(file_records))
+        restore_bytes = inventory.get("total_bytes", sum(r.get("size_bytes", 0) for r in file_records))
+        touched_ids = set(objects_by_id.keys())
+    else:
+        prefix_tuple = tuple(d + "/" for d in dir_prefixes)
+        file_set = set(file_paths)
+        restore_count = 0
+        restore_bytes = 0
+        touched_ids = set()
+        for rec in file_records:
+            rel = rec["relative_path"]
+            if rel in file_set or (prefix_tuple and rel.startswith(prefix_tuple)):
+                restore_count += 1
+                restore_bytes += rec.get("size_bytes", 0)
+                oid = rec.get("object_id")
+                if oid is not None:
+                    touched_ids.add(oid)
+
+    archive_files = 0
+    archive_bytes = 0
+    for oid in touched_ids:
+        obj = objects_by_id.get(oid)
+        if obj is None:
+            continue
+        archive_files += obj.get("file_count", 1)  # "file"-type objects wrap exactly 1 file
+        archive_bytes += obj.get("size_bytes", 0)
+
+    return {
+        "restore_count": restore_count,
+        "restore_bytes": restore_bytes,
+        "archive_files": archive_files,
+        "archive_bytes": archive_bytes,
+    }
+
+
 def detect_backend(inventory):
     archive = inventory.get("archive") or {}
     return "globus" if archive.get("backend") == "globus" else "s3"
@@ -246,10 +303,16 @@ class App:
         self.sort_mode_idx = 0
         self.marks = {}
         self.message = ""
+        self._summary_cache = None
 
     @property
     def sort_mode(self):
         return SORT_MODES[self.sort_mode_idx]
+
+    def get_summary(self):
+        if self._summary_cache is None:
+            self._summary_cache = compute_summary(self.inventory, self.marks)
+        return self._summary_cache
 
     def current_children(self):
         node = self.path_stack[-1]
@@ -326,13 +389,16 @@ class App:
             del self.marks[node.relpath]
         else:
             self.marks[node.relpath] = "dir" if node.is_dir else "file"
+        self._summary_cache = None
 
     def toggle_mark_current_dir(self):
         node = self.path_stack[-1]
         if node.relpath in self.marks:
             del self.marks[node.relpath]
+            self._summary_cache = None
         else:
             self.marks[node.relpath] = "dir"
+        self._summary_cache = None
 
     def write_script_flow(self):
         if not self.marks:
@@ -386,6 +452,13 @@ class App:
         marked_here = " [DIR MARKED]" if node.relpath in self.marks else ""
         header = f" {self.inventory_path}  ->  {breadcrumb}   [marked: {len(self.marks)}]{marked_here}"
         stdscr.addnstr(0, 0, header[:width - 1], width - 1, curses.A_BOLD)
+
+        summary = self.get_summary()
+        summary_line = (
+            f" Restore: {summary['restore_count']:,} file(s), {format_size(summary['restore_bytes'])}"
+            f"   |   Archive read: {summary['archive_files']:,} file(s), {format_size(summary['archive_bytes'])}"
+        )
+        stdscr.addnstr(1, 0, summary_line[:width - 1], width - 1)
 
         children = self.current_children()
         list_height = max(1, height - 3)
