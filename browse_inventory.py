@@ -152,19 +152,20 @@ def compute_restore_selection(marks):
 
 def compute_summary(inventory, marks):
     """
-    Return {"restore_count", "restore_bytes", "archive_files", "archive_bytes"}
+    Return {"restore_count", "restore_bytes", "archive_object_count", "archive_bytes"}
     for the current selection:
 
     - restore_count/restore_bytes: files that will actually be written to
       disk (the resolved, deduplicated selection from compute_restore_selection).
-    - archive_files/archive_bytes: files that must be read from the archive
-      to satisfy that restore. This can be larger than the restore totals,
-      because restoring even one file out of a shared tar group (see
-      archive_to_s3.py/archive_to_globus.py's small-file grouping) requires
-      downloading the entire group.
+    - archive_object_count/archive_bytes: distinct archive objects (tar
+      groups or standalone files, see archive_to_s3.py/archive_to_globus.py's
+      small-file grouping) that must be downloaded to satisfy that restore,
+      and their total stored size. Grouping means this is usually far fewer
+      than restore_count/total file count, since one tar download can supply
+      many restored files at once.
     """
     if not marks:
-        return {"restore_count": 0, "restore_bytes": 0, "archive_files": 0, "archive_bytes": 0}
+        return {"restore_count": 0, "restore_bytes": 0, "archive_object_count": 0, "archive_bytes": 0}
 
     file_records = inventory.get("files", [])
     objects_by_id = {obj["id"]: obj for obj in (inventory.get("archive") or {}).get("objects", [])}
@@ -190,19 +191,14 @@ def compute_summary(inventory, marks):
                 if oid is not None:
                     touched_ids.add(oid)
 
-    archive_files = 0
-    archive_bytes = 0
-    for oid in touched_ids:
-        obj = objects_by_id.get(oid)
-        if obj is None:
-            continue
-        archive_files += obj.get("file_count", 1)  # "file"-type objects wrap exactly 1 file
-        archive_bytes += obj.get("size_bytes", 0)
+    archive_bytes = sum(
+        objects_by_id[oid].get("size_bytes", 0) for oid in touched_ids if oid in objects_by_id
+    )
 
     return {
         "restore_count": restore_count,
         "restore_bytes": restore_bytes,
-        "archive_files": archive_files,
+        "archive_object_count": len(touched_ids & objects_by_id.keys()),
         "archive_bytes": archive_bytes,
     }
 
@@ -456,7 +452,7 @@ class App:
         summary = self.get_summary()
         summary_line = (
             f" Restore: {summary['restore_count']:,} file(s), {format_size(summary['restore_bytes'])}"
-            f"   |   Archive read: {summary['archive_files']:,} file(s), {format_size(summary['archive_bytes'])}"
+            f"   |   Archive read: {summary['archive_object_count']:,} object(s), {format_size(summary['archive_bytes'])}"
         )
         stdscr.addnstr(1, 0, summary_line[:width - 1], width - 1)
 
