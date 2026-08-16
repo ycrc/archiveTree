@@ -136,14 +136,21 @@ def _checksum_one(path, root_dir, verbose=False):
 
 def build_inventory(root_dir, verbose=False, max_workers=1):
     """Walk directory and compute inventory, hashing files in parallel."""
+    root_dir = os.path.abspath(root_dir)
+
     file_records = []
     file_paths = []
 
     file_list = []
+    dir_relpaths = []
     scan_pbar = None
     if verbose and tqdm:
         scan_pbar = tqdm(desc="Scanning", unit="files")
     for dirpath, _, filenames in os.walk(root_dir):
+        relpath = os.path.relpath(dirpath, root_dir)
+        if relpath == ".":
+            relpath = ""
+        dir_relpaths.append(relpath)
         if scan_pbar is not None:
             scan_pbar.set_postfix_str(dirpath, refresh=False)
         for name in filenames:
@@ -152,8 +159,6 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
                 scan_pbar.update(1)
     if scan_pbar is not None:
         scan_pbar.close()
-
-    root_dir = os.path.abspath(root_dir)
 
     vprint(verbose, f"Computing checksums with up to {max_workers} workers "
                     f"({len(file_list)} files)...")
@@ -185,6 +190,29 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
     file_records.sort(key=lambda r: walk_order.get(r["absolute_path"], 0))
     file_paths.sort(key=lambda p: walk_order.get(p, 0))
 
+    # Roll up file_count/total_bytes for every directory (including empty
+    # ones), recursively covering everything in its subtree. "" denotes the
+    # root directory itself.
+    dir_stats = {relpath: {"file_count": 0, "total_bytes": 0} for relpath in dir_relpaths}
+    for rec in file_records:
+        parent = os.path.dirname(rec["relative_path"])
+        while True:
+            stats = dir_stats.setdefault(parent, {"file_count": 0, "total_bytes": 0})
+            stats["file_count"] += 1
+            stats["total_bytes"] += rec["size_bytes"]
+            if parent == "":
+                break
+            parent = os.path.dirname(parent)
+
+    directories = [
+        {
+            "relative_path": relpath,
+            "file_count": stats["file_count"],
+            "total_bytes": stats["total_bytes"],
+        }
+        for relpath, stats in sorted(dir_stats.items())
+    ]
+
     inventory = {
         "inventory_id": str(uuid.uuid4()),
         "root_dir": root_dir,
@@ -192,6 +220,7 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
         "total_files": len(file_records),
         "total_bytes": sum(r["size_bytes"] for r in file_records),
         "files": file_records,
+        "directories": directories,
     }
 
     return inventory, file_paths
@@ -486,12 +515,16 @@ def write_summary_csv(inventory, restore_root, subset_relpaths, verify_status,
 # top-level "format_version" key. Bump this (and add the new value to
 # SUPPORTED_INVENTORY_VERSIONS) any time the top-level inventory JSON
 # schema changes in a way readers need to know about.
-CURRENT_INVENTORY_VERSION = 2
+#   1 - no "format_version" key present (implicit/legacy).
+#   2 - "format_version" key added.
+#   3 - added top-level "directories": per-directory recursive rollup of
+#       file_count/total_bytes (see build_inventory()).
+CURRENT_INVENTORY_VERSION = 3
 
 # Versions this codebase's readers know how to handle. Inventory files
 # written before this versioning scheme existed have no "format_version"
 # key at all; check_inventory_version() treats that as version 1.
-SUPPORTED_INVENTORY_VERSIONS = (1, 2)
+SUPPORTED_INVENTORY_VERSIONS = (1, 2, 3)
 
 
 def check_inventory_version(inventory):
