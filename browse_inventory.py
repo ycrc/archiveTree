@@ -10,14 +10,16 @@ re-scanning the full file list on every navigation.
 
 Navigation:
   up/k, down/j        move selection
-  right/Enter/space    enter directory
+  right/Enter          enter directory
   left/backspace       go up to parent
-  m                    toggle mark on the highlighted file/directory
+  space                toggle mark on the highlighted file/directory
   M                    toggle mark on the directory you're currently inside
   s                    cycle sort mode (name, size-desc/asc, count-desc/asc)
+  v                    toggle --verbose in the generated restore script
+  c                    clear all marks
   w                    write a restore script for the marked items
   d                    debug: list the archive objects (and sizes) needed for the current selection
-  q/Esc                quit
+  x/Esc                exit (offers to write a restore script first if anything is marked)
 
 Marking a directory selects its entire subtree; marking is not required on
 descendants of an already-marked directory (they're covered automatically,
@@ -232,7 +234,7 @@ def detect_backend(inventory):
 
 
 def build_restore_script(inventory_path, inventory, dir_prefixes, file_paths, whole_tree,
-                         restore_dir, script_dir):
+                         restore_dir, script_dir, verbose=True):
     backend = detect_backend(inventory)
     restore_script = "restore_from_globus.py" if backend == "globus" else "restore_from_s3.py"
     restore_script_path = os.path.join(script_dir, restore_script)
@@ -259,7 +261,8 @@ def build_restore_script(inventory_path, inventory, dir_prefixes, file_paths, wh
         cmd_groups.append(f"--only-prefix {shlex.quote(d + '/')}")
     for f in file_paths:
         cmd_groups.append(f"--only-path {shlex.quote(f)}")
-    cmd_groups.append("--verbose")
+    if verbose:
+        cmd_groups.append("--verbose")
 
     lines.append(" \\\n  ".join(cmd_groups))
     lines.append("")
@@ -372,6 +375,7 @@ class App:
         self.marks = {}
         self.message = ""
         self._summary_cache = None
+        self.verbose_script = True
 
     @property
     def sort_mode(self):
@@ -392,10 +396,28 @@ class App:
         while True:
             self.render()
             ch = self.stdscr.getch()
-            if ch in (ord("q"), 27):
-                break
+            if ch in (ord("x"), 27):
+                if self.request_exit():
+                    break
+                continue
             self.message = ""
             self.handle_key(ch)
+
+    def request_exit(self):
+        """Return True if the app should actually exit now."""
+        if not self.marks:
+            return True
+        choice = _prompt_char(
+            self.stdscr,
+            f"Exit: write restore script for {len(self.marks)} marked item(s) first? "
+            "[y/n, Esc=cancel exit]: ", "yn",
+        )
+        if choice is None:
+            self.message = "Exit cancelled."
+            return False
+        if choice == "y":
+            self.write_script_flow()
+        return True
 
     def handle_key(self, ch):
         children = self.current_children()
@@ -403,16 +425,21 @@ class App:
             self.move_cursor(-1, children)
         elif ch in (curses.KEY_DOWN, ord("j")):
             self.move_cursor(1, children)
-        elif ch in (curses.KEY_RIGHT, ord(" "), curses.KEY_ENTER, 10, 13):
+        elif ch in (curses.KEY_RIGHT, curses.KEY_ENTER, 10, 13):
             self.enter_selected(children)
         elif ch in (curses.KEY_LEFT, curses.KEY_BACKSPACE, 127, 8):
             self.go_up()
-        elif ch == ord("m"):
+        elif ch == ord(" "):
             self.toggle_mark(children)
         elif ch == ord("M"):
             self.toggle_mark_current_dir()
         elif ch == ord("s"):
             self.sort_mode_idx = (self.sort_mode_idx + 1) % len(SORT_MODES)
+        elif ch == ord("v"):
+            self.verbose_script = not self.verbose_script
+        elif ch == ord("c"):
+            self.marks = {}
+            self._summary_cache = None
         elif ch == ord("w"):
             self.write_script_flow()
         elif ch == ord("d"):
@@ -476,7 +503,7 @@ class App:
 
     def write_script_flow(self):
         if not self.marks:
-            self.message = "No items marked. Press 'm' to mark files/directories first."
+            self.message = "No items marked. Press space to mark files/directories first."
             return
 
         choice = _prompt_char(
@@ -505,7 +532,7 @@ class App:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         content = build_restore_script(
             self.inventory_path, self.inventory, dir_prefixes, file_paths, whole_tree,
-            restore_dir, script_dir,
+            restore_dir, script_dir, verbose=self.verbose_script,
         )
 
         script_path = os.path.abspath(os.path.expanduser(script_path))
@@ -524,7 +551,11 @@ class App:
         node = self.path_stack[-1]
         breadcrumb = node.relpath if node.relpath else "/"
         marked_here = " [DIR MARKED]" if node.relpath in self.marks else ""
-        header = f" {self.inventory_path}  ->  {breadcrumb}   [marked: {len(self.marks)}]{marked_here}"
+        verbose_state = "on" if self.verbose_script else "off"
+        header = (
+            f" {self.inventory_path}  ->  {breadcrumb}   "
+            f"[marked: {len(self.marks)}]{marked_here}   [verbose: {verbose_state}]"
+        )
         stdscr.addnstr(0, 0, header[:width - 1], width - 1, curses.A_BOLD)
 
         summary = self.get_summary()
@@ -559,7 +590,8 @@ class App:
 
         status = self.message or (
             f"{len(children)} entries | sort:{self.sort_mode} | "
-            "q:quit  jk/updown:nav  Enter/space:open  left/bksp:up  m:mark  M:mark-this-dir  s:sort  w:write script  d:debug objects"
+            "x:exit  jk/updown:nav  Enter:open  left/bksp:up  space:mark  M:mark-this-dir  "
+            "c:clear  s:sort  v:verbose  w:write script  d:debug objects"
         )
         stdscr.addnstr(height - 1, 0, status[:width - 1], width - 1, curses.A_REVERSE)
         stdscr.refresh()
