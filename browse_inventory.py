@@ -16,6 +16,7 @@ Navigation:
   M                    toggle mark on the directory you're currently inside
   s                    cycle sort mode (name, size-desc/asc, count-desc/asc)
   w                    write a restore script for the marked items
+  d                    debug: list the archive objects (and sizes) needed for the current selection
   q/Esc                quit
 
 Marking a directory selects its entire subtree; marking is not required on
@@ -150,6 +151,40 @@ def compute_restore_selection(marks):
     return kept_dirs, kept_files, False
 
 
+def _resolve_selection(inventory, marks):
+    """
+    Internal: resolve marks to (restore_count, restore_bytes, touched_object_ids)
+    for the current selection. Shared by compute_summary() and
+    compute_touched_objects() so they can't disagree about what's selected.
+    """
+    if not marks:
+        return 0, 0, set()
+
+    file_records = inventory.get("files", [])
+    dir_prefixes, file_paths, whole_tree = compute_restore_selection(marks)
+
+    if whole_tree:
+        restore_count = inventory.get("total_files", len(file_records))
+        restore_bytes = inventory.get("total_bytes", sum(r.get("size_bytes", 0) for r in file_records))
+        touched_ids = {obj["id"] for obj in (inventory.get("archive") or {}).get("objects", [])}
+        return restore_count, restore_bytes, touched_ids
+
+    prefix_tuple = tuple(d + "/" for d in dir_prefixes)
+    file_set = set(file_paths)
+    restore_count = 0
+    restore_bytes = 0
+    touched_ids = set()
+    for rec in file_records:
+        rel = rec["relative_path"]
+        if rel in file_set or (prefix_tuple and rel.startswith(prefix_tuple)):
+            restore_count += 1
+            restore_bytes += rec.get("size_bytes", 0)
+            oid = rec.get("object_id")
+            if oid is not None:
+                touched_ids.add(oid)
+    return restore_count, restore_bytes, touched_ids
+
+
 def compute_summary(inventory, marks):
     """
     Return {"restore_count", "restore_bytes", "archive_object_count", "archive_bytes"}
@@ -164,33 +199,8 @@ def compute_summary(inventory, marks):
       than restore_count/total file count, since one tar download can supply
       many restored files at once.
     """
-    if not marks:
-        return {"restore_count": 0, "restore_bytes": 0, "archive_object_count": 0, "archive_bytes": 0}
-
-    file_records = inventory.get("files", [])
+    restore_count, restore_bytes, touched_ids = _resolve_selection(inventory, marks)
     objects_by_id = {obj["id"]: obj for obj in (inventory.get("archive") or {}).get("objects", [])}
-
-    dir_prefixes, file_paths, whole_tree = compute_restore_selection(marks)
-
-    if whole_tree:
-        restore_count = inventory.get("total_files", len(file_records))
-        restore_bytes = inventory.get("total_bytes", sum(r.get("size_bytes", 0) for r in file_records))
-        touched_ids = set(objects_by_id.keys())
-    else:
-        prefix_tuple = tuple(d + "/" for d in dir_prefixes)
-        file_set = set(file_paths)
-        restore_count = 0
-        restore_bytes = 0
-        touched_ids = set()
-        for rec in file_records:
-            rel = rec["relative_path"]
-            if rel in file_set or (prefix_tuple and rel.startswith(prefix_tuple)):
-                restore_count += 1
-                restore_bytes += rec.get("size_bytes", 0)
-                oid = rec.get("object_id")
-                if oid is not None:
-                    touched_ids.add(oid)
-
     archive_bytes = sum(
         objects_by_id[oid].get("size_bytes", 0) for oid in touched_ids if oid in objects_by_id
     )
@@ -201,6 +211,19 @@ def compute_summary(inventory, marks):
         "archive_object_count": len(touched_ids & objects_by_id.keys()),
         "archive_bytes": archive_bytes,
     }
+
+
+def compute_touched_objects(inventory, marks):
+    """
+    Return the archive object dicts (id/type/key/size_bytes/...) that must be
+    downloaded to satisfy the current selection, largest first. This is the
+    per-object detail behind compute_summary()'s archive_object_count/bytes.
+    """
+    _, _, touched_ids = _resolve_selection(inventory, marks)
+    objects_by_id = {obj["id"]: obj for obj in (inventory.get("archive") or {}).get("objects", [])}
+    objs = [objects_by_id[oid] for oid in touched_ids if oid in objects_by_id]
+    objs.sort(key=lambda o: -o.get("size_bytes", 0))
+    return objs
 
 
 def detect_backend(inventory):
@@ -287,6 +310,55 @@ def _prompt_char(stdscr, prompt, valid_chars):
                 return c
 
 
+def _show_debug_view(stdscr, objects):
+    """Full-screen scrollable listing of the archive objects for the current selection."""
+    total_bytes = sum(o.get("size_bytes", 0) for o in objects)
+    idx = 0
+    scroll = 0
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+
+        header = f" Archive objects required for restore: {len(objects):,} object(s), {format_size(total_bytes)} total"
+        stdscr.addnstr(0, 0, header[:width - 1], width - 1, curses.A_BOLD)
+
+        list_height = max(1, height - 3)
+        if objects:
+            idx = max(0, min(idx, len(objects) - 1))
+            if idx < scroll:
+                scroll = idx
+            elif idx >= scroll + list_height:
+                scroll = idx - list_height + 1
+
+        for row in range(list_height):
+            i = scroll + row
+            if i >= len(objects):
+                break
+            obj = objects[i]
+            key = obj.get("s3_key") or obj.get("globus_path") or "?"
+            otype = obj.get("type", "?")
+            size_str = format_size(obj.get("size_bytes", 0))
+            extra = f"  file_count={obj['file_count']}" if "file_count" in obj else ""
+            line = f"{size_str:>10}  {otype:<5} {obj.get('id', '?'):<14} {key}{extra}"
+            attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+            stdscr.addnstr(row + 2, 0, line[:width - 1], width - 1, attr)
+
+        if objects:
+            status = f"{len(objects)} object(s) | q/Esc/d:back  jk/updown:scroll"
+        else:
+            status = "No objects required (nothing marked, or marks resolve to nothing). q/Esc/d:back"
+        stdscr.addnstr(height - 1, 0, status[:width - 1], width - 1, curses.A_REVERSE)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch in (ord("q"), ord("d"), 27):
+            return
+        if ch in (curses.KEY_UP, ord("k")) and objects:
+            idx -= 1
+        elif ch in (curses.KEY_DOWN, ord("j")) and objects:
+            idx += 1
+
+
 class App:
     def __init__(self, stdscr, inventory, inventory_path):
         self.stdscr = stdscr
@@ -343,6 +415,12 @@ class App:
             self.sort_mode_idx = (self.sort_mode_idx + 1) % len(SORT_MODES)
         elif ch == ord("w"):
             self.write_script_flow()
+        elif ch == ord("d"):
+            self.show_debug()
+
+    def show_debug(self):
+        objects = compute_touched_objects(self.inventory, self.marks)
+        _show_debug_view(self.stdscr, objects)
 
     def move_cursor(self, delta, children):
         if not children:
@@ -481,7 +559,7 @@ class App:
 
         status = self.message or (
             f"{len(children)} entries | sort:{self.sort_mode} | "
-            "q:quit  jk/updown:nav  Enter/space:open  left/bksp:up  m:mark  M:mark-this-dir  s:sort  w:write script"
+            "q:quit  jk/updown:nav  Enter/space:open  left/bksp:up  m:mark  M:mark-this-dir  s:sort  w:write script  d:debug objects"
         )
         stdscr.addnstr(height - 1, 0, status[:width - 1], width - 1, curses.A_REVERSE)
         stdscr.refresh()
