@@ -140,9 +140,18 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
     file_paths = []
 
     file_list = []
+    scan_pbar = None
+    if verbose and tqdm:
+        scan_pbar = tqdm(desc="Scanning", unit="files")
     for dirpath, _, filenames in os.walk(root_dir):
+        if scan_pbar is not None:
+            scan_pbar.set_postfix_str(dirpath, refresh=False)
         for name in filenames:
             file_list.append(os.path.join(dirpath, name))
+            if scan_pbar is not None:
+                scan_pbar.update(1)
+    if scan_pbar is not None:
+        scan_pbar.close()
 
     root_dir = os.path.abspath(root_dir)
 
