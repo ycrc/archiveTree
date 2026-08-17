@@ -34,13 +34,13 @@ paths from the object keys).
 
 ### On disk
 
-- Written by `write_inventory_file()` (`archive_common.py:549`), named
+- Written by `write_inventory_file()` (`archive_common.py:568`), named
   `<dirname>.inventory.<archive_id>.json.gz` by the two archive scripts.
 - Gzip-compressed by default (`gzip_output=True`). A copy is also uploaded/
   transferred to the backend itself, under `.../inventory/` in the same
   archive prefix — but that's a convenience/DR copy; the operative copy is
   the local one you pass to `restore_from_*.py`.
-- Read via `load_inventory_file()` (`archive_common.py:594`), which detects
+- Read via `load_inventory_file()` (`archive_common.py:613`), which detects
   gzip by magic bytes (`\x1f\x8b`), not by filename, so it transparently
   reads both new `.json.gz` files and the many pre-existing plain-text
   `.json` inventories written before compression was added.
@@ -54,21 +54,22 @@ paths from the object keys).
   "created_at": "2026-08-17T12:00:00Z",
   "total_files": 189,
   "total_bytes": 119191588,
-  "format_version": 3,
+  "format_version": 4,
   "files": [ /* per-file records */ ],
   "directories": [ /* per-directory rollups */ ],
+  "unreadable_files": [ /* files build_inventory() couldn't read */ ],
   "archive": { /* backend-specific: object list + destination info */ }
 }
 ```
 
-`files`, `directories`, `format_version` are added by `build_inventory()` and
-`write_inventory_file()` respectively; `archive` is assembled by
-`write_inventory_file()` from whatever `backend_meta` the caller passes in
-(see [S3 vs Globus](#s3-vs-globus-differences) below).
+`files`, `directories`, `unreadable_files`, `format_version` are added by
+`build_inventory()` and `write_inventory_file()` respectively; `archive` is
+assembled by `write_inventory_file()` from whatever `backend_meta` the
+caller passes in (see [S3 vs Globus](#s3-vs-globus-differences) below).
 
 ### Per-file record (`files[]`)
 
-Built by `_checksum_one()` (`archive_common.py:80`), one per regular file or
+Built by `_checksum_one()` (`archive_common.py:81`), one per regular file or
 symlink under `root_dir`:
 
 ```jsonc
@@ -79,7 +80,8 @@ symlink under `root_dir`:
   "ctime": "2026-08-10T09:00:00",
   "owner": "rdb9",
   "sha256": "...",
-  "is_symlink": false
+  "is_symlink": false,
+  "mode": 420
   // "symlink_target": "..."   -- present only if is_symlink is true
 }
 ```
@@ -93,15 +95,28 @@ Checksums: for a regular file, `sha256` is the hash of its contents. For a
 symlink, `sha256` is the hash of the **link target string**, not any file
 content — this is what `verify_restored_files()` re-checks after restore.
 Broken symlinks are recorded successfully (the target string is hashed
-regardless of whether it resolves). Sockets, FIFOs, and device files are
-silently skipped with a warning (`archive_common.py:96`) since they can't be
-meaningfully archived.
+regardless of whether it resolves).
+
+`mode` (added in format_version 4) is `stat.S_IMODE(st.st_mode)` — the
+POSIX permission bits (e.g. `420` decimal == `0o644`), captured from the
+same `os.lstat()` call used for everything else in the record. `owner` is
+purely informational (a username string from `pwd.getpwuid`); nothing on
+the restore path ever applies it — restored files are simply owned by
+whoever runs the restore. Directory permissions are never recorded at all.
+See [Permission handling](#permission-handling) below for how `mode` is
+(and isn't) restored.
+
+Sockets, FIFOs, and device files are silently skipped with a warning
+(`archive_common.py:100`) since they can't be meaningfully archived. Files
+that exist but can't be *read* (permission denied, or any other `OSError`
+while hashing) are handled differently — see
+[Unreadable files](#unreadable-files-unreadable_files) below.
 
 ### Per-directory rollup (`directories[]`)
 
 Added in format_version 3. One entry per directory in the tree, **including
 empty ones** (collected from every `os.walk()` iteration, not inferred from
-file paths — `archive_common.py:150`):
+file paths — `archive_common.py:161`):
 
 ```jsonc
 { "relative_path": "data/raw", "file_count": 20, "total_bytes": 9773629 }
@@ -149,29 +164,74 @@ presence of `s3_bucket` instead of an explicit tag.
 ### `format_version`
 
 A single top-level int, checked by `check_inventory_version()`
-(`archive_common.py:531`) right after loading, before anything else touches
+(`archive_common.py:550`) right after loading, before anything else touches
 the file:
 
 - **1** — no `format_version` key at all (every inventory written before
   this scheme existed; absence is treated as implicit version 1).
 - **2** — `format_version` key added, no schema change otherwise.
-- **3** — current. Adds `directories[]`.
+- **3** — adds `directories[]`.
+- **4** — current. Adds `mode` to each file record and top-level
+  `unreadable_files[]`.
 
 `SUPPORTED_INVENTORY_VERSIONS` is the allow-list readers accept;
 `CURRENT_INVENTORY_VERSION` is what new writes are stamped with. To add a
 new version: bump `CURRENT_INVENTORY_VERSION`, add it to
 `SUPPORTED_INVENTORY_VERSIONS`, and — since old and new versions must keep
-working side by side (there is a lot of format-1/2 data already archived
+working side by side (there is a lot of format-1/2/3 data already archived
 that will never be rewritten) — make the schema change additive wherever
 possible, and branch on `inventory.get("format_version", 1)` in the specific
-code that needs to know, rather than assuming the current shape.
+code that needs to know, rather than assuming the current shape. Every
+consumer of a possibly-missing new field should use `.get()` with a sane
+default/skip, exactly like `mode`/`unreadable_files` do for older inventories.
+
+### Unreadable files (`unreadable_files[]`)
+
+Added in format_version 4. `_checksum_one()` (`archive_common.py:81`)
+catches `OSError` (e.g. `PermissionError`) around the read/hash step of a
+regular file and returns a skip reason instead of letting the exception
+propagate. `build_inventory()` then does three things for each such file:
+prints an unconditional (not `--verbose`-gated) warning to stderr, appends
+`{"relative_path": ..., "reason": "unreadable: ..."}` to this list, and
+simply omits the file from `files[]`/the directory rollup — the archive run
+continues and completes normally with everything else. Before
+format_version 4, this crashed the whole archive with an unhandled
+traceback partway through the (otherwise complete) checksum pass, since
+nothing caught the exception all the way up through
+`ThreadPoolExecutor`/`Future.result()` to `archive_to_*.py`'s `main()`.
+
+### Permission handling
+
+Whether a file's permission bits survive a restore depends on which storage
+path it took, and is a good example of why the [tar-grouping cost](#why-restore-1-file-can-mean-download-100)
+matters beyond just bytes transferred:
+
+- **Small files** (bundled into a tar group): permission bits are restored
+  as an incidental side effect of Python's `tarfile` module — `create_tar()`
+  captures `st_mode` automatically when adding each file, and
+  `extract_tar()`'s plain `tar.extract()` call restores it by default.
+  Ownership (uid/gid) is *not* restored this way in practice, since
+  `tarfile.chown()` only attempts `os.chown()` when running as root.
+- **Large files** (their own S3/Globus object): as of format_version 4,
+  `download_file_from_s3()` (`restore_from_s3.py`) and the post-transfer
+  pass in `restore_from_globus.py:main()` explicitly `os.chmod()` the
+  restored file using the `mode` recorded in its inventory record. For an
+  inventory written before format_version 4 (no `mode` field), this is
+  skipped — the file just gets `open(..., "wb")`'s default permissions, as
+  it always did.
+- **Directories** are never handled either way — created directories (for
+  either storage path) get whatever `os.makedirs()`'s default mode
+  produces, since no directory's original permissions are ever recorded in
+  the inventory.
+- **Ownership** is recorded (the `owner` username string) but never
+  restored by anything in this codebase, for either storage path.
 
 ## Archive flow
 
 Both `archive_to_s3.py` and `archive_to_globus.py` follow the same sequence;
 only the upload/transfer mechanics differ.
 
-1. **`build_inventory(root_dir)`** (`archive_common.py:138`) walks the tree
+1. **`build_inventory(root_dir)`** (`archive_common.py:144`) walks the tree
    once, computing every file's checksum in parallel (`ThreadPoolExecutor`,
    `--max-workers`), then rolls up per-directory stats. Returns the inventory
    dict described above, with `files[]` in deterministic `os.walk()` order.
@@ -182,7 +242,7 @@ only the upload/transfer mechanics differ.
 3. **`group_small_files(small_files, size_grouping)`** greedily bins the
    small files into groups of ~`--size-grouping` bytes each (default 10 GB) —
    simple running-total bin packing, not size-balanced, just threshold-based
-   (`archive_common.py:237`).
+   (`archive_common.py:253`).
 
 4. A flat **job list** is built: one `"file"` job per large file, one
    `"tar"` job per small-file group, with sequential `object_id`s.
@@ -237,7 +297,7 @@ shape, diverging on transfer mechanics.
    `check_inventory_version()`, then a backend sanity check (S3 requires
    `archive.s3_bucket`; Globus requires `archive.backend == "globus"`).
 
-2. **`select_relpaths()`** (`archive_common.py:334`) resolves `--only-path`
+2. **`select_relpaths()`** (`archive_common.py:350`) resolves `--only-path`
    (exact match, repeatable) and `--only-prefix` (repeatable) against
    `files[]`. With neither flag, everything is selected. **Note:**
    `--only-prefix` matching is a plain `str.startswith()` — not
@@ -283,7 +343,7 @@ shape, diverging on transfer mechanics.
      the S3 path where each worker does both.
 
 6. **Optional `--verify-checksums`**: `verify_restored_files()`
-   (`archive_common.py:364`) re-hashes every restored file (or symlink
+   (`archive_common.py:380`) re-hashes every restored file (or symlink
    target) and compares to the inventory's recorded `sha256`, raising on any
    `missing`/`checksum_mismatch`.
 
