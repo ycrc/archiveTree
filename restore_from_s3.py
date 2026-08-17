@@ -377,10 +377,14 @@ def download_file_from_s3(
     s3_client,
     expected_size=None,
     verbose=False,
+    mode=None,
 ):
     """Download a single file object from S3 to dest_path.
 
     Assumes preflight_check_objects has already verified that the object is ready.
+
+    If `mode` is given (the original file's POSIX permission bits, from the
+    inventory record's "mode" field), it's applied via chmod after download.
     """
     vprint(verbose, f"Downloading file s3://{bucket}/{key} -> {dest_path}")
 
@@ -409,6 +413,12 @@ def download_file_from_s3(
                 f"Downloaded file size mismatch for s3://{bucket}/{key}: "
                 f"expected {expected_size}, got {actual_size}"
             )
+
+    if mode is not None:
+        try:
+            os.chmod(dest_path, mode)
+        except OSError as e:
+            print(f"WARNING: failed to restore permissions on {dest_path}: {e}", file=sys.stderr)
 
     vprint(verbose, f"File download complete: {dest_path}")
 
@@ -675,6 +685,8 @@ def main():
             for rel in rels:
                 dest = os.path.join(restore_root, rel)
                 vprint(verbose, f"[worker] Restoring single-file object_id={oid} to {dest}")
+                rec = records_by_rel.get(rel)
+                mode = rec.get("mode") if rec else None
                 download_file_from_s3(
                     bucket,
                     key,
@@ -682,6 +694,7 @@ def main():
                     s3_client,
                     expected_size=obj_size,
                     verbose=verbose,
+                    mode=mode,
                 )
             return None
 

@@ -373,6 +373,25 @@ def main():
                 total_bytes=batch_bytes, desc=f"Transfer batch{batch_num}",
             )
 
+        # Restore original permission bits for individually-transferred
+        # ("file"-type) objects. Tar members get theirs from tarfile
+        # extraction below.
+        for oid, rels, obj in jobs:
+            if obj.get("type") != "file":
+                continue
+            local_path = local_paths.get(oid)
+            if not local_path:
+                continue
+            (rel,) = tuple(rels)
+            rec = records_by_rel.get(rel)
+            mode = rec.get("mode") if rec else None
+            if mode is None:
+                continue
+            try:
+                os.chmod(local_path, mode)
+            except OSError as e:
+                print(f"WARNING: failed to restore permissions on {local_path}: {e}", file=sys.stderr)
+
         # Extract tars locally (parallel, CPU/disk-bound local work).
         temp_tars = []
 

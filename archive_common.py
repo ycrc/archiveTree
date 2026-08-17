@@ -15,6 +15,7 @@ scripts.
 """
 
 import os
+import sys
 import json
 import gzip
 import uuid
@@ -116,12 +117,16 @@ def _checksum_one(path, root_dir, verbose=False):
             "sha256": sha,
             "is_symlink": True,
             "symlink_target": link_target,
+            "mode": stat.S_IMODE(st.st_mode),
         }
     else:
         # Regular file (or other non-symlink); hash contents.
         # Suppress per-file tqdm bars when running in parallel to avoid
         # interleaved output; the outer progress bar covers overall progress.
-        sha = compute_sha256(path, verbose=verbose, use_tqdm=False)
+        try:
+            sha = compute_sha256(path, verbose=verbose, use_tqdm=False)
+        except OSError as e:
+            return None, path, f"unreadable: {e}"
         record = {
             "relative_path": relpath,
             "absolute_path": path,
@@ -130,6 +135,7 @@ def _checksum_one(path, root_dir, verbose=False):
             "owner": get_owner(st),
             "sha256": sha,
             "is_symlink": False,
+            "mode": stat.S_IMODE(st.st_mode),
         }
 
     return record, path, None
@@ -141,6 +147,7 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
 
     file_records = []
     file_paths = []
+    unreadable_files = []
 
     file_list = []
     dir_relpaths = []
@@ -177,6 +184,14 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
             record, path, skip_reason = fut.result()
             if record is None:
                 vprint(verbose, f"WARNING: skipping {path}: {skip_reason}.")
+                if skip_reason and skip_reason.startswith("unreadable"):
+                    relpath = os.path.relpath(path, root_dir)
+                    unreadable_files.append({"relative_path": relpath, "reason": skip_reason})
+                    print(
+                        f"WARNING: could not read {path} ({skip_reason}); "
+                        "skipped, not included in this archive.",
+                        file=sys.stderr,
+                    )
             else:
                 file_records.append(record)
                 file_paths.append(path)
@@ -222,6 +237,7 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
         "total_bytes": sum(r["size_bytes"] for r in file_records),
         "files": file_records,
         "directories": directories,
+        "unreadable_files": unreadable_files,
     }
 
     return inventory, file_paths
@@ -520,12 +536,15 @@ def write_summary_csv(inventory, restore_root, subset_relpaths, verify_status,
 #   2 - "format_version" key added.
 #   3 - added top-level "directories": per-directory recursive rollup of
 #       file_count/total_bytes (see build_inventory()).
-CURRENT_INVENTORY_VERSION = 3
+#   4 - added "mode" (POSIX permission bits, stat.S_IMODE) to each file
+#       record, and a top-level "unreadable_files" list (relative_path +
+#       reason) for files build_inventory() couldn't read and had to skip.
+CURRENT_INVENTORY_VERSION = 4
 
 # Versions this codebase's readers know how to handle. Inventory files
 # written before this versioning scheme existed have no "format_version"
 # key at all; check_inventory_version() treats that as version 1.
-SUPPORTED_INVENTORY_VERSIONS = (1, 2, 3)
+SUPPORTED_INVENTORY_VERSIONS = (1, 2, 3, 4)
 
 
 def check_inventory_version(inventory):
