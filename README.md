@@ -22,6 +22,9 @@ The inventory file is the single source of truth for a restore — keep it
 somewhere safe (it's also written back to the remote storage itself as a
 copy).
 
+For how this works internally (inventory format, archive/restore flow,
+S3-vs-Globus differences), see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Requirements
 
 - Python 3.9+
