@@ -31,13 +31,12 @@ shown with a '+' instead of '*').
 
 import argparse
 import curses
-import json
 import os
 import shlex
 import sys
 from datetime import datetime
 
-from archive_common import check_inventory_version
+from archive_common import check_inventory_version, load_inventory_file
 
 SORT_MODES = ["name", "size-desc", "size-asc", "count-desc", "count-asc"]
 
@@ -661,8 +660,7 @@ def main():
         print(f"ERROR: Inventory file not found: {inv_path}", file=sys.stderr)
         sys.exit(1)
 
-    with open(inv_path, "r", encoding="utf-8") as f:
-        inventory = json.load(f)
+    inventory = load_inventory_file(inv_path)
 
     version_error = check_inventory_version(inventory)
     if version_error:

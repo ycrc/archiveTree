@@ -16,6 +16,7 @@ scripts.
 
 import os
 import json
+import gzip
 import uuid
 import hashlib
 import tarfile
@@ -545,7 +546,7 @@ def check_inventory_version(inventory):
 
 # ---------- Inventory Writing ----------
 
-def write_inventory_file(inventory, backend_meta, objects, inventory_path, verbose=False):
+def write_inventory_file(inventory, backend_meta, objects, inventory_path, verbose=False, gzip_output=True):
     """
     Write inventory JSON file to inventory_path.
 
@@ -564,6 +565,12 @@ def write_inventory_file(inventory, backend_meta, objects, inventory_path, verbo
         "storage_class": "DEEP_ARCHIVE",
         "file_count": 42
       }
+
+    Written gzip-compressed by default (inventory files can get large on
+    trees with millions of entries); load_inventory_file() transparently
+    reads either form. `inventory_path` should end in ".json.gz" when
+    gzip_output is True, for discoverability, but this function doesn't
+    enforce that.
     """
     inv = dict(inventory)
     inv["format_version"] = CURRENT_INVENTORY_VERSION
@@ -577,7 +584,22 @@ def write_inventory_file(inventory, backend_meta, objects, inventory_path, verbo
     if inventory_dir:
         os.makedirs(inventory_dir, exist_ok=True)
 
-    with open(inventory_path, "w") as f:
+    opener = gzip.open if gzip_output else open
+    with opener(inventory_path, "wt", encoding="utf-8") as f:
         json.dump(inv, f, indent=2, sort_keys=True)
 
     vprint(verbose, f"Wrote inventory file {inventory_path}")
+
+
+def load_inventory_file(inventory_path):
+    """
+    Load an inventory JSON file, transparently handling gzip-compressed
+    files (detected via magic bytes, not the ".gz" suffix, so this works
+    regardless of how the file was named) alongside older plain-text
+    inventories written before gzip output was added.
+    """
+    with open(inventory_path, "rb") as f:
+        magic = f.read(2)
+    opener = gzip.open if magic == b"\x1f\x8b" else open
+    with opener(inventory_path, "rt", encoding="utf-8") as f:
+        return json.load(f)

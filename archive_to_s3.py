@@ -430,7 +430,7 @@ def main():
             objects.append(obj_meta)
 
     # Inventory file path – use --inventory-dir if given, else parent of root_dir
-    invname = f"{base_name}.inventory.{inventory['inventory_id']}.json"
+    invname = f"{base_name}.inventory.{inventory['inventory_id']}.json.gz"
     invpath = os.path.join(inv_dir, invname)
 
     # Always write the inventory file locally, once uploads have succeeded

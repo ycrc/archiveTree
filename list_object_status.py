@@ -22,14 +22,13 @@ Usage:
 """
 
 import argparse
-import json
 import os
 import sys
 
 import boto3
 from botocore.exceptions import ClientError
 
-from archive_common import check_inventory_version
+from archive_common import check_inventory_version, load_inventory_file
 
 GLACIER_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"}
 
@@ -157,8 +156,7 @@ def main():
         sys.exit(1)
 
     # Load inventory
-    with open(inv_path, "r", encoding="utf-8") as f:
-        inventory = json.load(f)
+    inventory = load_inventory_file(inv_path)
 
     version_error = check_inventory_version(inventory)
     if version_error:

@@ -395,7 +395,7 @@ def main():
         vprint(verbose, "No files to transfer.")
 
     # Inventory file path – use --inventory-dir if given, else parent of root_dir
-    invname = f"{base_name}.inventory.{inventory['inventory_id']}.json"
+    invname = f"{base_name}.inventory.{inventory['inventory_id']}.json.gz"
     invpath = os.path.join(inv_dir, invname)
 
     write_inventory_file(

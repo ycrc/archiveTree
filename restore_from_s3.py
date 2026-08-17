@@ -29,7 +29,6 @@ Parallel:
 import argparse
 import os
 import sys
-import json
 import uuid
 import tempfile
 import shutil
@@ -45,6 +44,7 @@ from archive_common import (
     verify_restored_files,
     write_summary_csv,
     check_inventory_version,
+    load_inventory_file,
 )
 
 # Optional tqdm for progress bars
@@ -529,8 +529,7 @@ def main():
         sys.exit(1)
 
     vprint(verbose, f"Loading inventory from {inv_path}")
-    with open(inv_path, "r", encoding="utf-8") as f:
-        inventory = json.load(f)
+    inventory = load_inventory_file(inv_path)
 
     version_error = check_inventory_version(inventory)
     if version_error:

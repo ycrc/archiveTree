@@ -119,8 +119,11 @@ python3 archive_to_s3.py --profile ycrcbjornson --verbose \
 ```
 
 The inventory is written next to `directory` (or `--inventory-dir`) as
-`<dirname>.inventory.<uuid>.json`, and a copy is uploaded to
-`s3://bucket/{prefix}/{dirname}/{archive_id}/inventory/`.
+`<dirname>.inventory.<uuid>.json.gz` (gzip-compressed to save space), and a
+copy is uploaded to `s3://bucket/{prefix}/{dirname}/{archive_id}/inventory/`.
+All the tools in this repo read inventories via a shared loader that
+transparently handles both gzip-compressed and older plain-text inventory
+files, so nothing needs to be decompressed by hand.
 
 ### `restore_from_s3.py`
 
@@ -152,7 +155,7 @@ Example:
 ```bash
 python3 restore_from_s3.py --profile ycrcbjornson \
     --restore-dir /path/to/restore --verify-checksums \
-    --summary-csv restore.csv mydata.inventory.<uuid>.json
+    --summary-csv restore.csv mydata.inventory.<uuid>.json.gz
 ```
 
 If any archived object is in `GLACIER`/`DEEP_ARCHIVE`/`GLACIER_IR` and not
@@ -322,7 +325,7 @@ Example:
 ```bash
 python3 restore_from_globus.py --restore-dir /path/to/restore \
     --verify-checksums --summary-csv restore.csv --verbose \
-    mydata.inventory.<uuid>.json
+    mydata.inventory.<uuid>.json.gz
 ```
 
 `--dest-collection`/`--dest-mount` default from the same
