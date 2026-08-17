@@ -73,6 +73,14 @@ def main():
         help=f"Path to cached Globus tokens (default: {globus_auth.DEFAULT_TOKEN_CACHE}).",
     )
     parser.add_argument(
+        "--login-domain", default=None,
+        help="Require the interactive Globus login to use an identity from this "
+             "domain (e.g. yale.edu), via session_required_single_domain. Only "
+             "takes effect on a fresh login -- run --globus-logout first if a "
+             "token cache already exists. Needed for collections that restrict "
+             "sessions to a specific institutional domain.",
+    )
+    parser.add_argument(
         "--config-file", default=None,
         help=f"Path to config file (default: {globus_config.DEFAULT_CONFIG_FILE}).",
     )
@@ -130,6 +138,14 @@ def main():
         help="Split into sequential batched transfer tasks if more items than this (default: 10000).",
     )
     parser.add_argument(
+        "--max-batch-bytes", type=int, default=100_000_000_000,
+        help="Split into sequential batched transfer tasks if the tar objects "
+             "to download (individually-transferred files riding along in a "
+             "batch don't count) would exceed this many bytes; bounds peak "
+             "local scratch-disk usage to roughly one batch's worth of "
+             "downloaded tars. Default: 1e11 (100GB).",
+    )
+    parser.add_argument(
         "--verbose", action="store_true",
         help="Print progress messages and show progress bars (if tqdm is installed).",
     )
@@ -146,6 +162,9 @@ def main():
     token_cache = globus_config.resolve(
         args.token_cache, "GLOBUS_ARCHIVE_TOKEN_CACHE", config, "token_cache"
     ) or globus_auth.DEFAULT_TOKEN_CACHE
+    login_domain = globus_config.resolve(
+        args.login_domain, "GLOBUS_ARCHIVE_LOGIN_DOMAIN", config, "login_domain"
+    )
 
     if args.globus_logout:
         globus_auth.logout(client_id=client_id, cache_path=token_cache)
@@ -344,11 +363,40 @@ def main():
                 vprint(verbose, f"WARNING: Unknown object type '{otype}' for object_id={oid}; skipping.")
 
         transfer_client = globus_auth.get_transfer_client(
-            client_id, cache_path=token_cache, verbose=verbose
+            client_id, cache_path=token_cache, verbose=verbose, login_domain=login_domain
         )
 
-        vprint(verbose, f"Transferring {len(jobs)} object(s) from Globus collection {archive_collection}...")
-        for batch_num, batch in enumerate(globus_transfer.batches(jobs, args.max_items_per_task)):
+        def extract_job(oid, rels, obj):
+            if obj.get("type") != "tar":
+                return None
+            tar_path = local_paths.get(oid)
+            if not tar_path or not os.path.isfile(tar_path):
+                vprint(verbose, f"WARNING: expected tar for object_id={oid} not found at {tar_path}")
+                return None
+            extract_tar(tar_path, restore_root, selected_relpaths=rels, verbose=verbose)
+            if args.keep_tar:
+                return tar_path
+            vprint(verbose, f"Removing temporary tar {tar_path}")
+            try:
+                os.remove(tar_path)
+            except OSError as e:
+                print(f"WARNING: Failed to remove temporary tar {tar_path}: {e}", file=sys.stderr)
+            return None
+
+        planned_batches = list(globus_transfer.batches_by_count_and_bytes(
+            jobs, args.max_items_per_task, args.max_batch_bytes,
+            item_bytes=lambda item: item[2]["size_bytes"] if item[2].get("type") == "tar" else None,
+        ))
+        vprint(
+            verbose,
+            f"Transferring {len(jobs)} object(s) in {len(planned_batches)} "
+            f"batch(es) from Globus collection {archive_collection}...",
+        )
+
+        temp_tars = []
+        max_workers = max(1, args.max_workers)
+
+        for batch_num, batch in enumerate(planned_batches):
             transfer_data = globus_transfer.new_transfer(
                 transfer_client, archive_collection, dest_collection,
                 label=f"restore {os.path.basename(restore_root)} batch{batch_num}",
@@ -373,52 +421,33 @@ def main():
                 total_bytes=batch_bytes, desc=f"Transfer batch{batch_num}",
             )
 
-        # Restore original permission bits for individually-transferred
-        # ("file"-type) objects. Tar members get theirs from tarfile
-        # extraction below.
-        for oid, rels, obj in jobs:
-            if obj.get("type") != "file":
-                continue
-            local_path = local_paths.get(oid)
-            if not local_path:
-                continue
-            (rel,) = tuple(rels)
-            rec = records_by_rel.get(rel)
-            mode = rec.get("mode") if rec else None
-            if mode is None:
-                continue
-            try:
-                os.chmod(local_path, mode)
-            except OSError as e:
-                print(f"WARNING: failed to restore permissions on {local_path}: {e}", file=sys.stderr)
+            # Restore original permission bits for individually-transferred
+            # ("file"-type) objects in this batch. Tar members get theirs
+            # from tarfile extraction below.
+            for oid, rels, obj in batch:
+                if obj.get("type") != "file":
+                    continue
+                local_path = local_paths.get(oid)
+                if not local_path:
+                    continue
+                (rel,) = tuple(rels)
+                rec = records_by_rel.get(rel)
+                mode = rec.get("mode") if rec else None
+                if mode is None:
+                    continue
+                try:
+                    os.chmod(local_path, mode)
+                except OSError as e:
+                    print(f"WARNING: failed to restore permissions on {local_path}: {e}", file=sys.stderr)
 
-        # Extract tars locally (parallel, CPU/disk-bound local work).
-        temp_tars = []
-
-        def extract_job(oid, rels, obj):
-            if obj.get("type") != "tar":
-                return None
-            tar_path = local_paths.get(oid)
-            if not tar_path or not os.path.isfile(tar_path):
-                vprint(verbose, f"WARNING: expected tar for object_id={oid} not found at {tar_path}")
-                return None
-            extract_tar(tar_path, restore_root, selected_relpaths=rels, verbose=verbose)
-            if args.keep_tar:
-                return tar_path
-            vprint(verbose, f"Removing temporary tar {tar_path}")
-            try:
-                os.remove(tar_path)
-            except OSError as e:
-                print(f"WARNING: Failed to remove temporary tar {tar_path}: {e}", file=sys.stderr)
-            return None
-
-        max_workers = max(1, args.max_workers)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(extract_job, oid, rels, obj) for (oid, rels, obj) in jobs]
-            for fut in as_completed(futures):
-                tpath = fut.result()
-                if tpath:
-                    temp_tars.append(tpath)
+            # Extract and remove this batch's downloaded tars immediately,
+            # rather than deferring until every batch has downloaded.
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(extract_job, oid, rels, obj) for (oid, rels, obj) in batch]
+                for fut in as_completed(futures):
+                    tpath = fut.result()
+                    if tpath:
+                        temp_tars.append(tpath)
 
         if created_scratch_dir:
             try:

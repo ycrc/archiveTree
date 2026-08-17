@@ -17,6 +17,15 @@ client_id = <native-app-client-id>
 # login. Env var: GLOBUS_ARCHIVE_TOKEN_CACHE
 token_cache = ~/.globus_archive_tokens.json
 
+# Optional: require the interactive login to use an identity from this
+# domain (e.g. yale.edu), via Globus's session_required_single_domain.
+# Needed for collections that restrict sessions to a specific institutional
+# domain -- picking the right identity provider on the login page alone is
+# not enough if that isn't your account's primary identity. Only takes
+# effect on a fresh login: run --globus-logout first if a token cache
+# already exists. Env var: GLOBUS_ARCHIVE_LOGIN_DOMAIN
+# login_domain = yale.edu
+
 # The Globus collection mapped to this machine's filesystem, and the local
 # path corresponding to that collection's root. Used as the "source" side
 # when archiving, and the "destination" side when restoring.

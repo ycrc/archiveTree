@@ -41,10 +41,32 @@ def require_under_mount(path, mount_prefix, what, mount_flag):
         sys.exit(1)
 
 
-def batches(items, batch_size):
-    """Yield successive batch_size-sized chunks of items."""
-    for i in range(0, len(items), batch_size):
-        yield items[i:i + batch_size]
+def batches_by_count_and_bytes(items, max_count, max_bytes, item_bytes):
+    """
+    Yield successive batches of items, starting a new batch whenever adding
+    the next item would make the current batch exceed max_count items or
+    max_bytes cumulative size (as reported by item_bytes(item), which may
+    return None/0 for items that should count toward max_count but not
+    toward max_bytes -- e.g. large files that transfer directly and never
+    touch scratch space).
+
+    A batch is only closed once it is non-empty, so a single item that
+    alone exceeds max_bytes still gets its own (oversized) batch rather
+    than never being yielded.
+    """
+    batch = []
+    batch_bytes = 0
+    for item in items:
+        b = item_bytes(item) or 0
+        would_exceed = len(batch) >= max_count or (batch_bytes + b) > max_bytes
+        if batch and would_exceed:
+            yield batch
+            batch = []
+            batch_bytes = 0
+        batch.append(item)
+        batch_bytes += b
+    if batch:
+        yield batch
 
 
 def local_path_to_collection_relative(abs_path, local_mount_prefix, collection_base_path):

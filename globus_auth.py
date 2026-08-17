@@ -38,15 +38,25 @@ def save_tokens(tokens, cache_path=DEFAULT_TOKEN_CACHE):
     os.chmod(cache_path, stat.S_IRUSR | stat.S_IWUSR)
 
 
-def interactive_login(client_id, scopes=TransferScopes.all, cache_path=DEFAULT_TOKEN_CACHE):
+def interactive_login(client_id, scopes=TransferScopes.all, cache_path=DEFAULT_TOKEN_CACHE,
+                       login_domain=None):
     """
     Run the Native App browser login flow, persist the resulting refresh
     token, and return the token dict for the transfer.api.globus.org
     resource server.
+
+    login_domain, if given, is passed as session_required_single_domain so
+    the resulting Globus Auth session is tied to an identity from that
+    domain (e.g. "yale.edu") rather than whatever the account's primary
+    identity happens to be -- picking the right identity provider on the
+    login page alone does not do this; some collections enforce it via a
+    session policy that only session_required_single_domain satisfies.
     """
     auth_client = globus_sdk.NativeAppAuthClient(client_id)
     auth_client.oauth2_start_flow(requested_scopes=scopes, refresh_tokens=True)
-    authorize_url = auth_client.oauth2_get_authorize_url()
+    authorize_url = auth_client.oauth2_get_authorize_url(
+        session_required_single_domain=login_domain
+    )
 
     print(f"Please go to this URL and login:\n\n{authorize_url}\n")
     auth_code = input("Please enter the code you get after login here: ").strip()
@@ -63,10 +73,14 @@ def interactive_login(client_id, scopes=TransferScopes.all, cache_path=DEFAULT_T
     return tokens
 
 
-def get_transfer_client(client_id, cache_path=DEFAULT_TOKEN_CACHE, verbose=False):
+def get_transfer_client(client_id, cache_path=DEFAULT_TOKEN_CACHE, verbose=False, login_domain=None):
     """
     Return a globus_sdk.TransferClient authorized via a cached refresh
     token, logging in interactively if no valid cache exists.
+
+    login_domain is forwarded to interactive_login() for the initial login
+    only; it has no effect if a token cache already exists (log out first
+    with --globus-logout to force a fresh login that honors it).
     """
     auth_client = globus_sdk.NativeAppAuthClient(client_id)
     tokens = load_tokens(cache_path)
@@ -74,7 +88,7 @@ def get_transfer_client(client_id, cache_path=DEFAULT_TOKEN_CACHE, verbose=False
     if tokens is None:
         if verbose:
             print("No cached Globus login found; starting interactive login...")
-        tokens = interactive_login(client_id, cache_path=cache_path)
+        tokens = interactive_login(client_id, cache_path=cache_path, login_domain=login_domain)
 
     def on_refresh(token_response):
         transfer_data = token_response.by_resource_server["transfer.api.globus.org"]

@@ -250,6 +250,31 @@ def main():
         )
         sys.exit(1)
 
+    s3_client = get_s3_client(args.profile, args.endpoint_url)
+
+    valid_storage_classes = s3_client.meta.service_model.shape_for("StorageClass").enum
+    if args.storage_class not in valid_storage_classes:
+        print(
+            f"ERROR: --storage-class {args.storage_class!r} is not valid. "
+            f"Choose from: {', '.join(sorted(valid_storage_classes))}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Verify credentials and bucket access now, before building the inventory
+    # or any tars, so a bad --profile/--endpoint-url/bucket fails fast instead
+    # of after a long run. Skipped on --dry-run, which never touches S3.
+    if not args.dry_run:
+        try:
+            s3_client.head_bucket(Bucket=args.bucket)
+        except Exception as e:
+            print(
+                f"ERROR: cannot access bucket {args.bucket!r} (check --profile, "
+                f"--endpoint-url, AWS credentials, and bucket name/permissions): {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     vprint(verbose, "Building inventory...")
     inventory, _ = build_inventory(root_dir, verbose=verbose,
                                    max_workers=args.max_workers)
@@ -276,8 +301,6 @@ def main():
         base_prefix = f"{opath}/{base_name}/{archive_id}"
     else:
         base_prefix = f"{base_name}/{archive_id}"
-
-    s3_client = get_s3_client(args.profile, args.endpoint_url)
 
     # Group small files into tars of approximately size_grouping bytes
     groups = group_small_files(small_files, size_grouping)

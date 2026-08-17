@@ -73,6 +73,14 @@ def main():
         help=f"Path to cached Globus tokens (default: {globus_auth.DEFAULT_TOKEN_CACHE}).",
     )
     parser.add_argument(
+        "--login-domain", default=None,
+        help="Require the interactive Globus login to use an identity from this "
+             "domain (e.g. yale.edu), via session_required_single_domain. Only "
+             "takes effect on a fresh login -- run --globus-logout first if a "
+             "token cache already exists. Needed for collections that restrict "
+             "sessions to a specific institutional domain.",
+    )
+    parser.add_argument(
         "--config-file", default=None,
         help=f"Path to config file (default: {globus_config.DEFAULT_CONFIG_FILE}).",
     )
@@ -124,6 +132,13 @@ def main():
         "--max-items-per-task", type=int, default=10000,
         help="Split into sequential batched transfer tasks if more items than this (default: 10000).",
     )
+    parser.add_argument(
+        "--max-batch-bytes", type=int, default=100_000_000_000,
+        help="Split into sequential batched transfer tasks if the built tars "
+             "(large files riding along in a batch don't count) would exceed "
+             "this many bytes; bounds peak local scratch-disk usage to "
+             "roughly one batch's worth of tars. Default: 1e11 (100GB).",
+    )
 
     args = parser.parse_args()
     verbose = args.verbose
@@ -137,6 +152,9 @@ def main():
     token_cache = globus_config.resolve(
         args.token_cache, "GLOBUS_ARCHIVE_TOKEN_CACHE", config, "token_cache"
     ) or globus_auth.DEFAULT_TOKEN_CACHE
+    login_domain = globus_config.resolve(
+        args.login_domain, "GLOBUS_ARCHIVE_LOGIN_DOMAIN", config, "login_domain"
+    )
 
     if args.globus_logout:
         globus_auth.logout(client_id=client_id, cache_path=token_cache)
@@ -174,6 +192,36 @@ def main():
     dest_path = globus_config.require(
         dest_path, "destination path", "--dest-path", "GLOBUS_ARCHIVE_DEST_PATH", "dest_path"
     )
+
+    # Unless this is a dry run, we'll eventually transfer, so require the
+    # full Globus config now -- before building the inventory or any tars --
+    # so a missing value fails fast instead of after a long run.
+    if not args.dry_run:
+        client_id = globus_config.require(
+            client_id, "Globus client ID", "--client-id", "GLOBUS_ARCHIVE_CLIENT_ID", "client_id"
+        )
+        source_collection = globus_config.resolve(
+            args.source_collection, "GLOBUS_ARCHIVE_SOURCE_COLLECTION", config, "source_collection"
+        )
+        source_collection = globus_config.require(
+            source_collection, "source collection", "--source-collection",
+            "GLOBUS_ARCHIVE_SOURCE_COLLECTION", "source_collection",
+        )
+        source_mount = globus_config.resolve(
+            args.source_mount, "GLOBUS_ARCHIVE_SOURCE_MOUNT", config, "source_mount"
+        )
+        source_mount = globus_config.require(
+            source_mount, "source mount", "--source-mount",
+            "GLOBUS_ARCHIVE_SOURCE_MOUNT", "source_mount",
+        )
+        dest_collection = globus_config.resolve(
+            args.dest_collection, "GLOBUS_ARCHIVE_DEST_COLLECTION", config, "dest_collection"
+        )
+        dest_collection = globus_config.require(
+            dest_collection, "destination collection", "--dest-collection",
+            "GLOBUS_ARCHIVE_DEST_COLLECTION", "dest_collection",
+        )
+        globus_transfer.require_under_mount(root_dir, source_mount, "the archived directory", "--source-mount")
 
     vprint(verbose, "Building inventory...")
     inventory, _ = build_inventory(root_dir, verbose=verbose, max_workers=args.max_workers)
@@ -215,7 +263,10 @@ def main():
     for g_idx, group in enumerate(groups):
         obj_id = f"tar-{object_counter:06d}"
         object_counter += 1
-        jobs.append({"kind": "tar", "obj_id": obj_id, "group": group, "group_index": g_idx})
+        jobs.append({
+            "kind": "tar", "obj_id": obj_id, "group": group, "group_index": g_idx,
+            "est_bytes": sum(r["size_bytes"] for r in group),
+        })
 
     # --- DRY RUN MODE ------------------------------------------------------
     if args.dry_run:
@@ -233,34 +284,6 @@ def main():
         print("\nNo transfers performed.")
         return
 
-    # From here on we're actually transferring, so require full Globus config.
-    client_id = globus_config.require(
-        client_id, "Globus client ID", "--client-id", "GLOBUS_ARCHIVE_CLIENT_ID", "client_id"
-    )
-    source_collection = globus_config.resolve(
-        args.source_collection, "GLOBUS_ARCHIVE_SOURCE_COLLECTION", config, "source_collection"
-    )
-    source_collection = globus_config.require(
-        source_collection, "source collection", "--source-collection",
-        "GLOBUS_ARCHIVE_SOURCE_COLLECTION", "source_collection",
-    )
-    source_mount = globus_config.resolve(
-        args.source_mount, "GLOBUS_ARCHIVE_SOURCE_MOUNT", config, "source_mount"
-    )
-    source_mount = globus_config.require(
-        source_mount, "source mount", "--source-mount",
-        "GLOBUS_ARCHIVE_SOURCE_MOUNT", "source_mount",
-    )
-    dest_collection = globus_config.resolve(
-        args.dest_collection, "GLOBUS_ARCHIVE_DEST_COLLECTION", config, "dest_collection"
-    )
-    dest_collection = globus_config.require(
-        dest_collection, "destination collection", "--dest-collection",
-        "GLOBUS_ARCHIVE_DEST_COLLECTION", "dest_collection",
-    )
-
-    globus_transfer.require_under_mount(root_dir, source_mount, "the archived directory", "--source-mount")
-
     tar_jobs = [j for j in jobs if j["kind"] == "tar"]
 
     if args.scratch_dir:
@@ -274,24 +297,18 @@ def main():
         globus_transfer.require_under_mount(scratch_dir, source_mount, "scratch directory", "--source-mount")
         os.makedirs(scratch_dir, exist_ok=True)
 
-        def build_tar_job(job):
-            group = job["group"]
-            g_idx = job["group_index"]
-            abs_paths = [r["absolute_path"] for r in group]
-            vprint(verbose, f"[worker] Creating tar for group {g_idx} with {len(group)} files...")
-            tar_path = create_tar(
-                root_dir, abs_paths, scratch_dir=scratch_dir,
-                tar_compression=compression, verbose=verbose, group_index=g_idx,
-            )
-            job["tar_path"] = tar_path
-            job["tar_size"] = os.path.getsize(tar_path)
-            return job
-
-        vprint(verbose, f"Building {len(tar_jobs)} tar(s) locally with up to {args.max_workers} workers...")
-        with ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as executor:
-            futures = [executor.submit(build_tar_job, j) for j in tar_jobs]
-            for fut in as_completed(futures):
-                fut.result()
+    def build_tar_job(job):
+        group = job["group"]
+        g_idx = job["group_index"]
+        abs_paths = [r["absolute_path"] for r in group]
+        vprint(verbose, f"[worker] Creating tar for group {g_idx} with {len(group)} files...")
+        tar_path = create_tar(
+            root_dir, abs_paths, scratch_dir=scratch_dir,
+            tar_compression=compression, verbose=verbose, group_index=g_idx,
+        )
+        job["tar_path"] = tar_path
+        job["tar_size"] = os.path.getsize(tar_path)
+        return job
 
     def add_item_for_job(transfer_data, job):
         if job["kind"] == "file":
@@ -319,11 +336,33 @@ def main():
 
     if jobs:
         transfer_client = globus_auth.get_transfer_client(
-            client_id, cache_path=token_cache, verbose=verbose
+            client_id, cache_path=token_cache, verbose=verbose, login_domain=login_domain
         )
 
-        vprint(verbose, f"Transferring {len(jobs)} object(s) to Globus collection {dest_collection}...")
-        for batch_num, batch in enumerate(globus_transfer.batches(jobs, args.max_items_per_task)):
+        planned_batches = list(globus_transfer.batches_by_count_and_bytes(
+            jobs, args.max_items_per_task, args.max_batch_bytes,
+            item_bytes=lambda j: j.get("est_bytes"),
+        ))
+        vprint(
+            verbose,
+            f"Transferring {len(jobs)} object(s) in {len(planned_batches)} "
+            f"batch(es) to Globus collection {dest_collection}...",
+        )
+
+        for batch_num, batch in enumerate(planned_batches):
+            batch_tar_jobs = [j for j in batch if j["kind"] == "tar"]
+
+            if batch_tar_jobs:
+                vprint(
+                    verbose,
+                    f"Building {len(batch_tar_jobs)} tar(s) for batch {batch_num} "
+                    f"with up to {args.max_workers} workers...",
+                )
+                with ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as executor:
+                    futures = [executor.submit(build_tar_job, j) for j in batch_tar_jobs]
+                    for fut in as_completed(futures):
+                        fut.result()
+
             transfer_data = globus_transfer.new_transfer(
                 transfer_client, source_collection, dest_collection,
                 label=f"archive {base_name} {archive_id} batch{batch_num}",
@@ -343,48 +382,48 @@ def main():
             )
             task_ids.append(task["task_id"])
 
-        for job in jobs:
-            obj_id = job["obj_id"]
-            dest_full_path = job["dest_full_path"]
+            for job in batch:
+                obj_id = job["obj_id"]
+                dest_full_path = job["dest_full_path"]
 
-            if job["kind"] == "file":
-                rec = job["rec"]
-                rec["object_id"] = obj_id
-                rec["object_type"] = "file"
-                rec["object_key"] = dest_full_path
-                objects.append({
-                    "id": obj_id,
-                    "type": "file",
-                    "globus_path": dest_full_path,
-                    "size_bytes": rec["size_bytes"],
-                    "relative_path": rec["relative_path"],
-                })
-            else:
-                group = job["group"]
-                for rec in group:
+                if job["kind"] == "file":
+                    rec = job["rec"]
                     rec["object_id"] = obj_id
-                    rec["object_type"] = "tar"
+                    rec["object_type"] = "file"
                     rec["object_key"] = dest_full_path
-                objects.append({
-                    "id": obj_id,
-                    "type": "tar",
-                    "globus_path": dest_full_path,
-                    "size_bytes": job["tar_size"],
-                    "file_count": len(group),
-                    "group_index": job["group_index"],
-                })
+                    objects.append({
+                        "id": obj_id,
+                        "type": "file",
+                        "globus_path": dest_full_path,
+                        "size_bytes": rec["size_bytes"],
+                        "relative_path": rec["relative_path"],
+                    })
+                else:
+                    group = job["group"]
+                    for rec in group:
+                        rec["object_id"] = obj_id
+                        rec["object_type"] = "tar"
+                        rec["object_key"] = dest_full_path
+                    objects.append({
+                        "id": obj_id,
+                        "type": "tar",
+                        "globus_path": dest_full_path,
+                        "size_bytes": job["tar_size"],
+                        "file_count": len(group),
+                        "group_index": job["group_index"],
+                    })
 
-        # Local tars are only removed after the whole transfer succeeds
-        # (unlike the S3 script, which removes each tar right after its own
-        # individual upload completes).
-        for job in tar_jobs:
-            tar_path = job.get("tar_path")
-            if tar_path:
-                vprint(verbose, f"Removing temporary tar {tar_path}")
-                try:
-                    os.remove(tar_path)
-                except OSError:
-                    pass
+            # Tars for this batch are removed as soon as this batch's
+            # transfer succeeds, rather than deferred to the end, so a
+            # mid-run failure leaves at most one batch's tars on disk.
+            for job in batch_tar_jobs:
+                tar_path = job.get("tar_path")
+                if tar_path:
+                    vprint(verbose, f"Removing temporary tar {tar_path}")
+                    try:
+                        os.remove(tar_path)
+                    except OSError:
+                        pass
 
         if created_scratch_dir:
             try:
@@ -420,7 +459,9 @@ def main():
     inv_source_path = globus_transfer.local_path_to_collection_relative(invpath, source_mount, "/")
 
     vprint(verbose, f"Transferring inventory to {dest_collection}:{inv_dest_path} ...")
-    transfer_client = globus_auth.get_transfer_client(client_id, cache_path=token_cache, verbose=verbose)
+    transfer_client = globus_auth.get_transfer_client(
+        client_id, cache_path=token_cache, verbose=verbose, login_domain=login_domain
+    )
     inv_transfer_data = globus_transfer.new_transfer(
         transfer_client, source_collection, dest_collection,
         label=f"archive {base_name} {archive_id} inventory",
