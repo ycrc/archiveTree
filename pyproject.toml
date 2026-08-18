@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "archiveTree"
+version = "1.0.0"
+description = "Archive directory trees to Amazon S3 or a Globus collection as size-grouped tar objects, and browse/restore from the resulting inventory."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "boto3>=1.35",
+    "globus-sdk>=3.41",
+    "tqdm>=4.70",
+]
+
+[project.urls]
+Homepage = "https://github.com/ycrc/archiveTree"
+
+[project.scripts]
+archive-to-s3 = "archive_to_s3:main"
+restore-from-s3 = "restore_from_s3:main"
+archive-to-globus = "archive_to_globus:main"
+restore-from-globus = "restore_from_globus:main"
+browse-inventory = "browse_inventory:main"
+list-object-status = "list_object_status:main"
+
+[tool.setuptools]
+py-modules = [
+    "archive_common",
+    "archive_to_s3",
+    "restore_from_s3",
+    "archive_to_globus",
+    "restore_from_globus",
+    "globus_auth",
+    "globus_config",
+    "globus_transfer",
+    "browse_inventory",
+    "list_object_status",
+]
