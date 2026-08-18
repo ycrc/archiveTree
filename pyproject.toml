@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "archiveTree"
-version = "1.0.0"
+version = "0.2"
 description = "Archive directory trees to Amazon S3 or a Globus collection as size-grouped tar objects, and browse/restore from the resulting inventory."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "boto3>=1.35",
+    "boto3>=1.26.163",
     "globus-sdk>=3.41",
-    "tqdm>=4.70",
+    "tqdm>=4.64.1",
 ]
 
 [project.urls]
