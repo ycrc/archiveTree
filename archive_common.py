@@ -524,6 +524,44 @@ def verify_restored_files(inventory, restore_root,
     return status_map
 
 
+def restore_directory_permissions(inventory, restore_root, verbose=False):
+    """
+    Best-effort restore of each directory's recorded POSIX permission bits
+    (format_version 5+; a no-op per-directory for older inventories, since
+    "mode" is simply absent from their records).
+
+    Only directories that actually exist under restore_root are touched --
+    for a partial restore (--only-path/--only-prefix), most directories in
+    the inventory were never (re)created and are correctly skipped. Applied
+    deepest-first, after all file content has been written, so setting a
+    restrictive mode (e.g. missing write/execute bits) on a parent never
+    blocks creating or chmod'ing something still to come inside it.
+    """
+    directories = inventory.get("directories", [])
+
+    # Deepest first: more path separators means deeper. The empty string
+    # (restore_root itself) sorts last, as depth 0.
+    ordered = sorted(
+        directories,
+        key=lambda rec: rec["relative_path"].count(os.sep),
+        reverse=True,
+    )
+
+    for rec in ordered:
+        mode = rec.get("mode")
+        if mode is None:
+            continue
+        full_path = os.path.join(restore_root, rec["relative_path"])
+        if not os.path.isdir(full_path):
+            continue
+        try:
+            os.chmod(full_path, mode)
+        except OSError as e:
+            print(f"WARNING: failed to restore permissions on {full_path}: {e}", file=sys.stderr)
+
+    vprint(verbose, "Restored directory permissions where recorded.")
+
+
 def write_summary_csv(inventory, restore_root, subset_relpaths, verify_status,
                       csv_path, verbose=False):
     """
