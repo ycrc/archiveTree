@@ -300,6 +300,27 @@ def create_tar(root_dir, abs_paths, scratch_dir=None, tar_compression=None,
     return tar_path
 
 
+def _extract_member(tar, member, restore_root):
+    """
+    tarfile.TarFile.extract() creates missing parent directories via a
+    check-then-create (os.path.exists() then os.makedirs(), with no
+    exist_ok) that isn't atomic. Restore scripts call extract_tar()
+    concurrently from multiple worker threads, one per tar-group object; if
+    two of those tar files share an as-yet-uncreated parent directory (e.g.
+    both contain files under "b/"), both threads can pass the exists check
+    and race on makedirs(), and the loser raises FileExistsError even though
+    nothing is actually wrong. (Directory-type members don't have this
+    problem -- tarfile's makedir() already catches FileExistsError itself.)
+    A single retry is always safe here: by the time the exception is
+    raised, the directory has already been created by the winning thread,
+    so the retried extract() sees it exists and proceeds normally.
+    """
+    try:
+        tar.extract(member, path=restore_root)
+    except FileExistsError:
+        tar.extract(member, path=restore_root)
+
+
 def extract_tar(tar_path, restore_root, selected_relpaths=None, verbose=False):
     """
     Extract tar into restore_root.
@@ -340,7 +361,7 @@ def extract_tar(tar_path, restore_root, selected_relpaths=None, verbose=False):
                     if name not in selected_relpaths:
                         continue
 
-            tar.extract(member, path=restore_root)
+            _extract_member(tar, member, restore_root)
 
     vprint(verbose, "Extraction complete.")
 
@@ -348,9 +369,11 @@ def extract_tar(tar_path, restore_root, selected_relpaths=None, verbose=False):
 # ---------- Restore-side selection / verification ----------
 
 def detect_backend(inventory):
-    """Return "globus" or "s3", based on inventory["archive"]["backend"]."""
+    """Return "globus", "local", or "s3" (default), based on
+    inventory["archive"]["backend"]."""
     archive = inventory.get("archive") or {}
-    return "globus" if archive.get("backend") == "globus" else "s3"
+    backend = archive.get("backend")
+    return backend if backend in ("globus", "local") else "s3"
 
 
 def select_relpaths(inventory, only_paths=None, only_prefixes=None, verbose=False):

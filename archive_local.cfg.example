@@ -1,0 +1,23 @@
+# Example config for archive_to_local.py / restore_from_local.py.
+#
+# Copy to ~/.archive_globus.cfg (or point --config-file at a copy elsewhere;
+# the filename is shared across all backends -- see archive_config.py) and
+# fill in real values. If you're also using the S3 or Globus backends, this
+# [local] section can simply be added to the same config file as their
+# [s3]/[globus] sections instead of using a separate file.
+#
+# Precedence for every value below: CLI flag > this file. (The local
+# backend has no per-field environment variables, unlike Globus.)
+
+[local]
+# Locally-mounted destination directory under which archive objects are
+# stored (e.g. an NFS or Lustre mount point). Must already be mounted and
+# writable -- this tool does not mount anything itself.
+dest_dir = /path/to/mount
+
+# Optional: select the local backend by default in [archive] so you don't
+# need to pass --backend local on every archive.py/restore.py invocation.
+# Only relevant if you're using the unified entrypoints; archive_to_local.py
+# / restore_from_local.py don't read this section.
+[archive]
+backend = local

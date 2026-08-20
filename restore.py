@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Unified restore entrypoint: picks a backend (s3 or globus) via --backend,
-the [archive] section of a config file, or by auto-detecting it from the
-inventory file's own archive.backend field, then dispatches straight into
-that backend's existing restore_from_s3.py / restore_from_globus.py logic.
+Unified restore entrypoint: picks a backend (s3, globus, or local) via
+--backend, the [archive] section of a config file, or by auto-detecting it
+from the inventory file's own archive.backend field, then dispatches
+straight into that backend's existing restore_from_s3.py /
+restore_from_globus.py / restore_from_local.py logic.
 
 Thin dispatcher, not a merged implementation -- see archive.py's docstring
 for why. Once the backend is known, every other flag (including
@@ -17,6 +18,7 @@ import sys
 import archive_common
 import archive_config
 import restore_from_globus
+import restore_from_local
 import restore_from_s3
 
 from archive import extract_dispatch_flags
@@ -80,22 +82,22 @@ def main(argv=None):
     if backend is None:
         if "-h" in remaining or "--help" in remaining:
             print(
-                "usage: restore.py [--backend {s3,globus}] [--config-file PATH] inventory_file ...\n\n"
-                "No backend selected yet -- pass --backend s3|globus, set 'backend' "
+                "usage: restore.py [--backend {s3,globus,local}] [--config-file PATH] inventory_file ...\n\n"
+                "No backend selected yet -- pass --backend s3|globus|local, set 'backend' "
                 f"in the [archive] section of {config_path}, or point this at a "
                 "readable inventory file to auto-detect it, then re-run with "
                 "--help to see that backend's full flag list."
             )
             sys.exit(0)
         print(
-            "ERROR: could not determine backend. Pass --backend {s3,globus}, set "
+            "ERROR: could not determine backend. Pass --backend {s3,globus,local}, set "
             f"'backend' in the [archive] section of {config_path}, or point this "
             "at a readable inventory file to auto-detect it.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    backend_mod = {"s3": restore_from_s3, "globus": restore_from_globus}[backend]
+    backend_mod = {"s3": restore_from_s3, "globus": restore_from_globus, "local": restore_from_local}[backend]
     backend_parser = backend_mod.build_arg_parser()
     backend_parser.set_defaults(config_file=config_path)
 

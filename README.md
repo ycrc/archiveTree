@@ -1,14 +1,17 @@
 # archiveTree
 
 Tools for archiving a directory tree to remote storage and restoring it
-later, with two interchangeable backends:
+later, with three interchangeable backends:
 
 - **S3** (`archive_to_s3.py` / `restore_from_s3.py`), including Glacier /
   Deep Archive support.
 - **Globus** (`archive_to_globus.py` / `restore_from_globus.py`), for
   destinations only reachable via a Globus collection.
+- **Local** (`archive_to_local.py` / `restore_from_local.py`), for a
+  locally-mounted destination directory (e.g. NFS/Lustre) — no cloud
+  credentials or SDKs required.
 
-Both backends work the same way conceptually:
+All three backends work the same way conceptually:
 
 1. `archive_to_*.py` walks a directory, computes a SHA256 checksum and
    metadata for every file, packs small files into tar bundles (large files
@@ -23,7 +26,7 @@ somewhere safe (it's also written back to the remote storage itself as a
 copy).
 
 For how this works internally (inventory format, archive/restore flow,
-S3-vs-Globus differences), see [ARCHITECTURE.md](ARCHITECTURE.md).
+backend differences), see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Requirements
 
@@ -31,6 +34,12 @@ S3-vs-Globus differences), see [ARCHITECTURE.md](ARCHITECTURE.md).
 - `boto3` (for the S3 tools)
 - `globus-sdk` (for the Globus tools)
 - `tqdm` (optional; enables progress bars with `--verbose`)
+
+The local backend (`archive_to_local.py` / `restore_from_local.py`) needs
+none of the above beyond the Python standard library — it never imports
+`boto3` or `globus_sdk`, so it works in any environment (and is a
+convenient way to exercise most of this tool's logic without cloud
+credentials at all).
 
 Both S3 and Globus dependencies are available in the `archiver` conda
 environment on this system.
@@ -57,7 +66,7 @@ Every inventory JSON has this shape:
       "is_symlink": false,
       "object_id": "tar-000000",     // which archived object holds this file
       "object_type": "tar",          // "file" or "tar"
-      "object_key": "..."            // S3 key or Globus collection-relative path
+      "object_key": "..."            // S3 key, Globus collection-relative path, or local filesystem path
     },
     ...
   ],
@@ -69,6 +78,9 @@ Every inventory JSON has this shape:
     "globus_dest_collection": "<uuid>",
     "globus_dest_path": "...",
     "transfer_task_ids": ["<uuid>", ...],
+    // Local backend:
+    "backend": "local",
+    "local_dest_dir": "/path/to/mount",
 
     "archive_id": "<uuid>",
     "objects": [
@@ -175,6 +187,105 @@ inventory without doing a restore:
 ```
 list_object_status.py [--profile PROFILE] [--endpoint-url URL] \
     [--verbose] [--only-status {ready,cold,restoring,error}] inventory_file
+```
+
+---
+
+## Local backend
+
+Use this when your destination is a locally-mounted directory (e.g. an NFS
+or Lustre mount point) rather than S3 or a Globus collection. No cloud
+credentials or SDKs are required — `archive_to_local.py` /
+`restore_from_local.py` only need the destination directory to already be
+mounted and writable; this tool never mounts anything itself. This also
+makes the local backend a convenient way to test archiveTree's core logic
+end-to-end without any credentials at all.
+
+To avoid passing `dest_dir` on every invocation, copy the example config
+and fill in your mount path:
+
+```bash
+cp archive_local.cfg.example ~/.archive_globus.cfg
+```
+
+```ini
+[local]
+dest_dir = /path/to/mount
+```
+
+(The config filename is shared across all backends — see
+`archive_local.cfg.example` for details, including how to add this section
+to an existing S3/Globus config file instead of using a separate one.)
+
+### `archive_to_local.py`
+
+```
+archive_to_local.py [options] directory dest_dir
+```
+
+| Argument | Description |
+|---|---|
+| `directory` | Directory tree to archive. |
+| `dest_dir` | Locally-mounted destination directory under which archive objects are stored. Optional if `dest_dir` is set in the `[local]` section of the config file. |
+| `--scratch-dir` | Where local tars are built (default: system temp). |
+| `--compression {none,gz}` | Tar compression. Default `none`. |
+| `--delete` | Delete the source directory tree after a successful archive. Default: keep it. |
+| `--config-file` | Config file path (default `~/.archive_globus.cfg`), read for the `[local]` section's `dest_dir`. |
+| `--verify-checksum` | After each copy, recompute SHA256 of the destination and compare it to the source checksum. Off by default: size-only verification (a plain filesystem copy has no network-transit integrity gap the way S3 uploads do, so this is opt-in rather than automatic). |
+| `--size-cutoff` | Files bigger than this (bytes) are copied individually. Default `1e9`. |
+| `--size-grouping` | Target tar-group size in bytes. Default `1e10`. |
+| `--max-workers` | Parallel hashing/copy workers. Default `4`. |
+| `--dry-run` | Preview the plan; no tars, copies, or deletes. |
+| `--inventory-dir` | Where to write the local inventory JSON (default: parent of `directory`). |
+| `--no-summary` | Suppress the final summary. |
+| `--verbose` | Progress messages / progress bars. |
+
+Example:
+
+```bash
+python3 archive_to_local.py --verbose --size-cutoff 1000000 \
+    /path/to/mydata /mnt/archive_storage
+```
+
+The inventory is written next to `directory` (or `--inventory-dir`) as
+`<dirname>.inventory.<uuid>.json.gz`, and a copy is placed under
+`{dest_dir}/{dirname}/{archive_id}/inventory/`, mirroring the layout used
+under `files/` and `groups/` for the archived objects themselves.
+
+### `restore_from_local.py`
+
+```
+restore_from_local.py [options] inventory_file
+```
+
+Same shape as `restore_from_s3.py`, minus all Glacier-style
+preflight/restore-request logic (a local filesystem has no tiered storage —
+objects are always immediately available) and minus `--keep-tar` (nothing
+temporary is ever created for a local tar object: it's extracted directly
+from its location under `dest_dir` instead of being copied to
+`--scratch-dir` first, since it's already local).
+
+| Argument | Description |
+|---|---|
+| `inventory_file` | Inventory JSON from `archive_to_local.py`. |
+| `--config-file` | Config file path (currently unused by this backend; kept for CLI consistency). |
+| `--scratch-dir` | Unused by this backend (tar objects extract directly from `dest_dir`); kept for CLI consistency. |
+| `--restore-dir` | Restore target (default: the original `root_dir` recorded in the inventory). |
+| `--overwrite` | Allow restoring into a non-empty directory. |
+| `--only-path PATH` | Restore only this relative path (repeatable). |
+| `--only-prefix PREFIX` | Restore only paths starting with this prefix (repeatable). |
+| `--verify-checksums` | Re-hash restored files and compare to the inventory. |
+| `--summary-csv PATH` | Write a CSV summary (`relative_path,full_path,size_bytes,verify_status`). |
+| `--dry-run` | Preview the plan; no copies, extraction, or writes. |
+| `--max-workers` | Parallel copy/verify workers. Default `4`. |
+| `--verbose` | Progress messages. |
+
+Example:
+
+```bash
+python3 restore_from_local.py --restore-dir /path/to/restore \
+    --verify-checksums --summary-csv restore.csv --verbose \
+    mydata.inventory.<uuid>.json.gz
 ```
 
 ---

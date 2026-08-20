@@ -241,7 +241,10 @@ def restore_command_groups(inventory_path, inventory, dir_prefixes, file_paths,
     about what command a selection produces.
     """
     backend = detect_backend(inventory)
-    restore_script = "restore_from_globus.py" if backend == "globus" else "restore_from_s3.py"
+    restore_script = {
+        "globus": "restore_from_globus.py",
+        "local": "restore_from_local.py",
+    }.get(backend, "restore_from_s3.py")
     restore_script_path = os.path.join(script_dir, restore_script)
 
     cmd_groups = [
@@ -380,7 +383,7 @@ def _show_debug_view(stdscr, objects, command_lines):
             if i >= len(objects):
                 break
             obj = objects[i]
-            key = obj.get("s3_key") or obj.get("globus_path") or "?"
+            key = obj.get("s3_key") or obj.get("globus_path") or obj.get("local_path") or "?"
             otype = obj.get("type", "?")
             size_str = format_size(obj.get("size_bytes", 0))
             extra = f"  file_count={obj['file_count']}" if "file_count" in obj else ""

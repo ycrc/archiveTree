@@ -1,10 +1,18 @@
-# Example config for archive_to_globus.py / restore_from_globus.py.
+# Example config for archive_to_globus.py / restore_from_globus.py, and the
+# [local] section used by archive_to_local.py / restore_from_local.py.
 #
 # Copy to ~/.archive_globus.cfg (or point --config-file / $GLOBUS_ARCHIVE_CONFIG
 # at a copy elsewhere) and fill in real values.
 #
 # Precedence for every value below: CLI flag > environment variable > this
 # file. Environment variable names are noted in each comment.
+
+[local]
+# Locally-mounted destination directory under which archive objects are
+# stored (e.g. an NFS or Lustre mount point). Must already be mounted and
+# writable -- this tool does not mount anything itself. No env var; supply
+# via the CLI positional or this config key.
+dest_dir = /path/to/mount
 
 [globus]
 # Globus Native App client ID, registered at

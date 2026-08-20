@@ -13,9 +13,10 @@ for usage.
 | `archive_common.py` | Transport-agnostic core: inventory building, tar create/extract, checksum verification, size partitioning/grouping, inventory JSON read/write, `detect_backend()`. Imports neither `boto3` nor `globus_sdk`. |
 | `archive_to_s3.py` / `restore_from_s3.py` | S3 backend (via `boto3`), with optional `[s3]`-section config-file support. |
 | `archive_to_globus.py` / `restore_from_globus.py` | Globus Transfer backend. |
-| `archive.py` / `restore.py` | Thin dispatchers: pick a backend (s3/globus) via `--backend`, a config file, or (restore only) the inventory's own `archive.backend` field, then call straight into the matching backend script's `run()`. See [Unified entrypoints](#unified-entrypoints-archivepy--restorepy). |
+| `archive_to_local.py` / `restore_from_local.py` | Local filesystem backend: copies to/from a locally-mounted destination directory, with optional `[local]`-section config-file support. No SDK dependency at all. |
+| `archive.py` / `restore.py` | Thin dispatchers: pick a backend (s3/globus/local) via `--backend`, a config file, or (restore only) the inventory's own `archive.backend` field, then call straight into the matching backend script's `run()`. See [Unified entrypoints](#unified-entrypoints-archivepy--restorepy). |
 | `globus_auth.py` | Native App OAuth login flow + token cache, shared by the two Globus scripts. |
-| `archive_config.py` | Generalized CLI-flag / env-var / config-file precedence resolution, over a multi-section INI file (`[archive]`/`[s3]`/`[globus]`). Shared by all backend scripts and both dispatchers. |
+| `archive_config.py` | Generalized CLI-flag / env-var / config-file precedence resolution, over a multi-section INI file (`[archive]`/`[s3]`/`[globus]`/`[local]`). Shared by all backend scripts and both dispatchers. |
 | `globus_config.py` | Thin backward-compatible wrapper around `archive_config.py`, scoped to the `[globus]` section — existing Globus scripts/config files need no changes. |
 | `globus_transfer.py` | `TransferData` construction, submission, and polling; local-path ↔ collection-relative-path mapping. |
 | `list_object_status.py` | Reports each S3 object's storage class / Glacier restore status for an inventory. |
@@ -29,20 +30,20 @@ by construction, not just by convention, and it lets tools like
 ## The inventory file
 
 Every archive produces exactly one inventory: a JSON document that is the
-sole record of which S3 object or Globus path each original file ended up
-in. **It is the only thing that makes a restore possible** — losing it means
-the archived objects are just opaque blobs (short of manually reconstructing
-paths from the object keys).
+sole record of which S3 object, Globus path, or local filesystem path each
+original file ended up in. **It is the only thing that makes a restore
+possible** — losing it means the archived objects are just opaque blobs
+(short of manually reconstructing paths from the object keys).
 
 ### On disk
 
-- Written by `write_inventory_file()` (`archive_common.py:574`), named
-  `<dirname>.inventory.<archive_id>.json.gz` by the two archive scripts.
-- Gzip-compressed by default (`gzip_output=True`). A copy is also uploaded/
-  transferred to the backend itself, under `.../inventory/` in the same
-  archive prefix — but that's a convenience/DR copy; the operative copy is
-  the local one you pass to `restore_from_*.py`.
-- Read via `load_inventory_file()` (`archive_common.py:619`), which detects
+- Written by `write_inventory_file()` (`archive_common.py:628`), named
+  `<dirname>.inventory.<archive_id>.json.gz` by all three archive scripts.
+- Gzip-compressed by default (`gzip_output=True`). A copy is also
+  uploaded/transferred/copied to the backend itself, under `.../inventory/`
+  in the same archive prefix — but that's a convenience/DR copy; the
+  operative copy is the local one you pass to `restore_from_*.py`.
+- Read via `load_inventory_file()` (`archive_common.py:673`), which detects
   gzip by magic bytes (`\x1f\x8b`), not by filename, so it transparently
   reads both new `.json.gz` files and the many pre-existing plain-text
   `.json` inventories written before compression was added.
@@ -67,7 +68,7 @@ paths from the object keys).
 `files`, `directories`, `unreadable_files`, `format_version` are added by
 `build_inventory()` and `write_inventory_file()` respectively; `archive` is
 assembled by `write_inventory_file()` from whatever `backend_meta` the
-caller passes in (see [S3 vs Globus](#s3-vs-globus-differences) below).
+caller passes in (see [Backend differences](#backend-differences) below).
 
 ### Per-file record (`files[]`)
 
@@ -90,8 +91,8 @@ symlink under `root_dir`:
 
 After the archive script assigns each file to an object, three more keys are
 mutated onto the same dict in place: `object_id`, `object_type`
-(`"file"` or `"tar"`), `object_key` (the S3 key or Globus path of the object
-holding this file's bytes).
+(`"file"` or `"tar"`), `object_key` (the S3 key, Globus path, or local
+filesystem path of the object holding this file's bytes).
 
 Checksums: for a regular file, `sha256` is the hash of its contents. For a
 symlink, `sha256` is the hash of the **link target string**, not any file
@@ -118,10 +119,10 @@ while hashing) are handled differently — see
 
 Added in format_version 3. One entry per directory in the tree, **including
 empty ones** (collected from every `os.walk()` iteration, not inferred from
-file paths — `archive_common.py:161`):
+file paths — `archive_common.py:158`):
 
 ```jsonc
-{ "relative_path": "data/raw", "file_count": 20, "total_bytes": 9773629 }
+{ "relative_path": "data/raw", "file_count": 20, "total_bytes": 9773629, "mode": 493 }
 ```
 
 `file_count`/`total_bytes` are recursive — everything under that directory,
@@ -131,9 +132,17 @@ not just its direct children. The root directory itself is the entry with
 show directory sizes without re-scanning the full `files` list on every
 navigation — it's a precomputed `du`, done once at archive time.
 
+`mode` (added in format_version 5, mirroring the per-file `mode` added in
+format_version 4) is `stat.S_IMODE(st.st_mode)` for the directory itself,
+captured via `os.lstat(dirpath)` alongside the same `os.walk()` pass
+(`archive_common.py:164`). It's `null` if that `lstat()` call itself failed
+(e.g. a race with something removing the directory mid-walk) — every reader
+must treat `mode` as optional, same as the per-file field. See
+[Permission handling](#permission-handling) for how it's used on restore.
+
 ### `archive` section and object records
 
-`archive.objects` is a flat list describing every S3/Globus object the
+`archive.objects` is a flat list describing every S3/Globus/local object the
 archive produced. Two shapes:
 
 ```jsonc
@@ -146,41 +155,48 @@ archive produced. Two shapes:
   "storage_class": "STANDARD", "file_count": 20, "group_index": 0 }
 ```
 
-(Globus objects use `"globus_path"` instead of `"s3_key"` and have no
-`storage_class`.) Note the shared `object_counter` in both archive scripts:
-large-file jobs are numbered first (`file-000000`, `file-000001`, ...), then
-tar-group jobs continue the *same* counter (`tar-000002`, `tar-000003`, ...)
-— the numeric suffix is not restarted per type.
+(Globus objects use `"globus_path"` instead of `"s3_key"`; local objects use
+`"local_path"` (relative to `local_dest_dir`) and additionally carry
+`"sha256"` on tar-type objects when `--verify-checksum` was used. Neither
+Globus nor local objects have `storage_class`.) Note the shared
+`object_counter` in all three archive scripts: large-file jobs are numbered
+first (`file-000000`, `file-000001`, ...), then tar-group jobs continue the
+*same* counter (`tar-000002`, `tar-000003`, ...) — the numeric suffix is not
+restarted per type.
 
 `archive` also carries backend-specific fields merged in by
 `write_inventory_file`'s `backend_meta` argument:
 
 - **S3**: `{"backend": "s3", "s3_bucket": bucket}`
 - **Globus**: `{"backend": "globus", "globus_dest_collection": ..., "globus_dest_path": ..., "transfer_task_ids": [...]}`
+- **Local**: `{"backend": "local", "local_dest_dir": dest_dir}`
 
-Both restore scripts guard against being pointed at the wrong backend's
-inventory: `restore_from_globus.py` requires `archive.backend == "globus"`
-(`restore_from_globus.py:200`); `restore_from_s3.py` requires
-`archive.backend` to be absent or `"s3"` (`restore_from_s3.py:570`) — the
+All three restore scripts guard against being pointed at the wrong
+backend's inventory: `restore_from_globus.py` requires
+`archive.backend == "globus"` (`restore_from_globus.py:201`);
+`restore_from_local.py` requires `archive.backend == "local"`
+(`restore_from_local.py`, same style); `restore_from_s3.py` requires
+`archive.backend` to be absent or `"s3"` (`restore_from_s3.py:571`) — the
 "absent" case keeps inventories written before the `"backend"` key existed
-working. `archive_common.detect_backend()` (`archive_common.py:350`)
-implements the same `"globus" if archive.get("backend") == "globus" else
-"s3"` logic for callers (`browse_inventory.py`, `restore.py`) that need to
-*pick* a backend before dispatching, rather than just validating one after
-the fact.
+working. `archive_common.detect_backend()` (`archive_common.py:362`)
+implements the equivalent 3-way logic — `backend if backend in ("globus",
+"local") else "s3"` — for callers (`browse_inventory.py`, `restore.py`)
+that need to *pick* a backend before dispatching, rather than just
+validating one after the fact.
 
 ### `format_version`
 
 A single top-level int, checked by `check_inventory_version()`
-(`archive_common.py:556`) right after loading, before anything else touches
+(`archive_common.py:610`) right after loading, before anything else touches
 the file:
 
 - **1** — no `format_version` key at all (every inventory written before
   this scheme existed; absence is treated as implicit version 1).
 - **2** — `format_version` key added, no schema change otherwise.
 - **3** — adds `directories[]`.
-- **4** — current. Adds `mode` to each file record and top-level
-  `unreadable_files[]`.
+- **4** — adds `mode` to each file record and top-level `unreadable_files[]`.
+- **5** — current. Adds `mode` to each *directory* record in `directories[]`
+  too (`null` if the directory couldn't be `lstat()`'d at archive time).
 
 `SUPPORTED_INVENTORY_VERSIONS` is the allow-list readers accept;
 `CURRENT_INVENTORY_VERSION` is what new writes are stamped with. To add a
@@ -220,24 +236,46 @@ matters beyond just bytes transferred:
   `extract_tar()`'s plain `tar.extract()` call restores it by default.
   Ownership (uid/gid) is *not* restored this way in practice, since
   `tarfile.chown()` only attempts `os.chown()` when running as root.
-- **Large files** (their own S3/Globus object): as of format_version 4,
-  `download_file_from_s3()` (`restore_from_s3.py`) and the post-transfer
-  pass in `restore_from_globus.py:run()` explicitly `os.chmod()` the
-  restored file using the `mode` recorded in its inventory record. For an
-  inventory written before format_version 4 (no `mode` field), this is
-  skipped — the file just gets `open(..., "wb")`'s default permissions, as
-  it always did.
-- **Directories** are never handled either way — created directories (for
-  either storage path) get whatever `os.makedirs()`'s default mode
-  produces, since no directory's original permissions are ever recorded in
-  the inventory.
+- **Large files** (their own S3/Globus/local object): as of format_version 4,
+  `download_file_from_s3()` (`restore_from_s3.py`), the post-transfer pass
+  in `restore_from_globus.py:run()`, and `copy_file_from_local()`
+  (`restore_from_local.py`) all explicitly `os.chmod()` the restored file
+  using the `mode` recorded in its inventory record. For an inventory
+  written before format_version 4 (no `mode` field), this is skipped — the
+  file just gets the copy/write call's default permissions, as it always
+  did (though for local, `shutil.copy2` already preserves the source file's
+  mode as a side effect regardless, unlike S3/Globus's fresh downloads).
+- **Directories**: as of format_version 5, `restore_directory_permissions()`
+  (`archive_common.py`, shared by both restore scripts) `os.chmod()`s every
+  directory that has a recorded `mode` *and* actually exists under
+  `restore_root` after the restore, using the mode from its `directories[]`
+  record. It runs once, after all file content has been written (both
+  storage paths), deepest-first (most path separators first) — restoring a
+  restrictive parent mode (e.g. one missing the execute/search bit) before
+  a still-to-be-touched child would make that child unreachable for its own
+  `chmod()` call, so children are always done first. For an inventory
+  written before format_version 5 (no `mode` on directory records, or a
+  `null` value from a failed `lstat()` at archive time), the corresponding
+  directory is simply skipped — it keeps whatever `os.makedirs()`'s default
+  mode produced, as it always did. A directory that doesn't exist after
+  restore (e.g. never (re)created by a `--only-path`/`--only-prefix` subset
+  restore, or one that was empty in the original tree — see below) is also
+  skipped, not created just to be chmod'd.
+- **Empty directories** (zero files anywhere in their subtree) are *not*
+  recreated on restore regardless of this feature: nothing in the restore
+  path ever calls `os.makedirs()` for a directory that has no file selected
+  underneath it (tar extraction only creates the parent dirs its member
+  files need). Their `mode` is still captured and stored at archive time,
+  it just has nothing to apply to on restore — a pre-existing gap, not
+  something this feature changes.
 - **Ownership** is recorded (the `owner` username string) but never
-  restored by anything in this codebase, for either storage path.
+  restored by anything in this codebase, for either storage path or either
+  files/directories.
 
 ## Archive flow
 
-Both `archive_to_s3.py` and `archive_to_globus.py` follow the same sequence;
-only the upload/transfer mechanics differ.
+`archive_to_s3.py`, `archive_to_globus.py`, and `archive_to_local.py` all
+follow the same sequence; only the upload/transfer mechanics differ.
 
 1. **`build_inventory(root_dir)`** (`archive_common.py:144`) walks the tree
    once, computing every file's checksum in parallel (`ThreadPoolExecutor`,
@@ -250,12 +288,12 @@ only the upload/transfer mechanics differ.
 3. **`group_small_files(small_files, size_grouping)`** greedily bins the
    small files into groups of ~`--size-grouping` bytes each (default 10 GB) —
    simple running-total bin packing, not size-balanced, just threshold-based
-   (`archive_common.py:253`).
+   (`archive_common.py:265`).
 
 4. A flat **job list** is built: one `"file"` job per large file, one
    `"tar"` job per small-file group, with sequential `object_id`s.
 
-5. **Upload/transfer** (this is where the two backends diverge):
+5. **Upload/transfer** (this is where the three backends diverge):
 
    - **S3** (`archive_to_s3.py:588` `process_job`): each job — file or tar —
      is handled by one worker in a single `ThreadPoolExecutor`. A `"tar"`
@@ -276,7 +314,22 @@ only the upload/transfer mechanics differ.
      default 10000) and submitted via `globus_transfer.submit_and_wait()`,
      which polls `task_wait()` until the task completes (`:381`).
 
-   Either way, each file's record gets `object_id`/`object_type`/
+   - **Local** (`archive_to_local.py:process_job`): structurally identical
+     to S3's model — each job, file or tar, is handled synchronously by one
+     worker in a single `ThreadPoolExecutor`; a `"tar"` job calls
+     `create_tar()` then copies it. `copy_file_to_local()` copies via
+     `shutil.copy2` and always verifies destination size against source;
+     when `--verify-checksum` is passed it additionally re-hashes the
+     destination with SHA256 and compares it to the checksum already on the
+     file's inventory record (or, for tar objects, to a SHA256 computed from
+     the freshly-built local tar just before the copy — there's no
+     per-tar checksum otherwise). There's no CRC64NVME-style machinery here:
+     that exists purely to work around S3's inability to return a genuine
+     whole-object checksum for a multipart upload except via the CRC
+     family; a same-machine filesystem copy has no such limitation, so a
+     direct SHA256 comparison suffices.
+
+   In all three cases, each file's record gets `object_id`/`object_type`/
    `object_key` mutated onto it in place as jobs complete. This is safe
    without locks because every record is only ever written by the one
    worker that owns it — mutating "the file record" (a dict already in
@@ -344,17 +397,18 @@ failure.
 
 ## Restore flow
 
-`restore_from_s3.py` and `restore_from_globus.py` again share the same
-shape, diverging on transfer mechanics.
+`restore_from_s3.py`, `restore_from_globus.py`, and `restore_from_local.py`
+again all share the same shape, diverging on transfer mechanics.
 
 1. **Load + validate**: `load_inventory_file()` then
    `check_inventory_version()`, then a backend guard — S3 requires
-   `archive.backend` to be absent or `"s3"` (`restore_from_s3.py:570`) and
+   `archive.backend` to be absent or `"s3"` (`restore_from_s3.py:571`) and
    also requires `archive.s3_bucket`; Globus requires
-   `archive.backend == "globus"` (`restore_from_globus.py:200`) — before
-   either script touches the objects themselves.
+   `archive.backend == "globus"` (`restore_from_globus.py:201`); local
+   requires `archive.backend == "local"` and `archive.local_dest_dir` — before
+   any script touches the objects themselves.
 
-2. **`select_relpaths()`** (`archive_common.py:356`) resolves `--only-path`
+2. **`select_relpaths()`** (`archive_common.py:368`) resolves `--only-path`
    (exact match, repeatable) and `--only-prefix` (repeatable) against
    `files[]`. With neither flag, everything is selected. **Note:**
    `--only-prefix` matching is a plain `str.startswith()` — not
@@ -399,12 +453,28 @@ shape, diverging on transfer mechanics.
      (`extract_job`) — transfer and extraction are fully decoupled, unlike
      the S3 path where each worker does both.
 
-6. **Optional `--verify-checksums`**: `verify_restored_files()`
-   (`archive_common.py:386`) re-hashes every restored file (or symlink
+   - **Local** (`restore_from_local.py`): no preflight either — objects
+     under `local_dest_dir` are always immediately available, there's no
+     tiered-storage concept. One `ThreadPoolExecutor` worker per object
+     either `shutil.copy2`s a `"file"`-type object straight to its final
+     destination path, or, for a `"tar"`-type object, calls
+     `extract_tar(..., selected_relpaths=rels)` **directly against its
+     location under `local_dest_dir`** — unlike S3/Globus, there is no
+     scratch-dir download step at all, since the object is already a local
+     file; copying it to `--scratch-dir` first would just be a redundant
+     local-to-local copy.
+
+6. **`restore_directory_permissions()`** (`archive_common.py`, unconditional,
+   no flag): `os.chmod()`s every directory with a recorded `mode` that
+   actually exists under `restore_root`, deepest-first. See
+   [Permission handling](#permission-handling) above.
+
+7. **Optional `--verify-checksums`**: `verify_restored_files()`
+   (`archive_common.py:398`) re-hashes every restored file (or symlink
    target) and compares to the inventory's recorded `sha256`, raising on any
    `missing`/`checksum_mismatch`.
 
-7. **Optional `--summary-csv`**: `write_summary_csv()` writes
+8. **Optional `--summary-csv`**: `write_summary_csv()` writes
    `relative_path,full_path,size_bytes,verify_status` for the restored
    subset.
 
@@ -422,21 +492,24 @@ restore — see below.
 ## Unified entrypoints (`archive.py` / `restore.py`)
 
 `archive.py` and `restore.py` are thin dispatchers, not a merged
-implementation of the two backends — S3 and Globus have fundamentally
-different transfer execution models (S3: synchronous per-object calls in a
-`ThreadPoolExecutor`; Globus: one or a few async, server-managed transfer
-tasks), and collapsing them into one shared loop was deliberately avoided
-(see [S3 vs Globus differences](#s3-vs-globus-differences) below). What
-they unify is just the *entrypoint*: pick a backend, then hand off to that
-backend's existing, unmodified logic.
+implementation of the three backends — S3, Globus, and local have
+fundamentally different transfer execution models (S3: synchronous
+per-object calls in a `ThreadPoolExecutor`; Globus: one or a few async,
+server-managed transfer tasks; local: synchronous per-object filesystem
+copies in a `ThreadPoolExecutor`, structurally like S3 but with no network
+transport at all), and collapsing them into one shared loop was
+deliberately avoided (see [Backend differences](#backend-differences)
+below). What they unify is just the *entrypoint*: pick a backend, then hand
+off to that backend's existing, unmodified logic.
 
-This works because all four backend scripts (`archive_to_s3.py`,
-`archive_to_globus.py`, `restore_from_s3.py`, `restore_from_globus.py`) are
-each split into `build_arg_parser() -> argparse.ArgumentParser` and
-`run(args) -> None`, with a thin `main() = run(build_arg_parser().parse_args())`
-kept for fully backward-compatible standalone invocation. The dispatchers
-call `build_arg_parser()` and `run()` directly — in-process function calls,
-not a subprocess — so `archive.py --backend s3 ...` is behaviorally
+This works because all six backend scripts (`archive_to_s3.py`,
+`archive_to_globus.py`, `archive_to_local.py`, `restore_from_s3.py`,
+`restore_from_globus.py`, `restore_from_local.py`) are each split into
+`build_arg_parser() -> argparse.ArgumentParser` and `run(args) -> None`,
+with a thin `main() = run(build_arg_parser().parse_args())` kept for fully
+backward-compatible standalone invocation. The dispatchers call
+`build_arg_parser()` and `run()` directly — in-process function calls, not
+a subprocess — so `archive.py --backend s3 ...` is behaviorally
 indistinguishable from calling `archive_to_s3.py ...` directly with the
 same flags.
 
@@ -467,25 +540,27 @@ two flags this module actually owns has no such ambiguity.
 **Config file**: the same physical file used by the Globus scripts today
 (default `~/.archive_globus.cfg`, overridable via `--config-file` /
 `GLOBUS_ARCHIVE_CONFIG`), generalized to hold multiple named INI sections —
-`[archive]` (`backend = s3|globus`), `[s3]`
+`[archive]` (`backend = s3|globus|local`), `[s3]`
 (`bucket`/`object_path`/`profile`/`endpoint_url`/`storage_class` for
-archiving, `profile`/`endpoint_url` for restoring), and the pre-existing
-`[globus]` section, unchanged. `archive_config.py` generalizes
-`globus_config.py`'s old CLI-flag/env-var/config-file precedence helpers to
-take a `section` argument; `globus_config.py` is now a thin wrapper around
-it, scoped to `[globus]`, kept purely for backward compatibility so
-existing Globus config files and call sites need zero changes.
+archiving, `profile`/`endpoint_url` for restoring), `[local]` (`dest_dir`),
+and the pre-existing `[globus]` section, unchanged. `archive_config.py`
+generalizes `globus_config.py`'s old CLI-flag/env-var/config-file
+precedence helpers to take a `section` argument; `globus_config.py` is now
+a thin wrapper around it, scoped to `[globus]`, kept purely for backward
+compatibility so existing Globus config files and call sites need zero
+changes.
 
-## S3 vs Globus differences
+## Backend differences
 
-| | S3 | Globus |
-|---|---|---|
-| Transfer unit | Individual synchronous `boto3` calls, one per object | Batched async `TransferData` tasks (poll to completion) |
-| Verification | App-level: `head_object` size check after each upload, plus a whole-object CRC64NVME checksum comparison when supported (see [Upload checksum verification](#upload-checksum-verification-s3)) | Server-side: `verify_checksum=True` / `sync_level="checksum"` on the transfer itself |
-| Tiered storage | Yes — Glacier/Deep Archive preflight + restore-request flow | No such concept; Globus collections aren't tiered |
-| Auth | AWS profile / env creds (`boto3` default chain) | Native App OAuth device flow, cached refresh token (`globus_auth.py`) |
-| Path model | Global flat key namespace (`s3_key`) | Collection-relative paths (`globus_path`); local paths must be mapped via `--source-mount`/`--dest-mount` (`globus_transfer.local_path_to_collection_relative()`) — everything you touch (source dir, scratch dir, inventory file, restore dir) must live under the configured mount, or `require_under_mount()` exits with an error |
-| Config resolution | CLI flag → `[s3]` config section → error, via `archive_config.resolve()`/`require()` (`archive_config.py:38`); no env-var step, and only `bucket`/`object_path`/`profile`/`endpoint_url`/`storage_class` are config-fillable | CLI flag → env var → `[globus]` config section → error, via `globus_config.resolve()`/`require()`, now a thin wrapper around `archive_config.py` (`globus_config.py:18`) |
+| | S3 | Globus | Local |
+|---|---|---|---|
+| Transfer unit | Individual synchronous `boto3` calls, one per object | Batched async `TransferData` tasks (poll to completion) | Individual synchronous `shutil.copy2` calls, one per object |
+| Verification | App-level: `head_object` size check after each upload, plus a whole-object CRC64NVME checksum comparison when supported (see [Upload checksum verification](#upload-checksum-verification-s3)) | Server-side: `verify_checksum=True` / `sync_level="checksum"` on the transfer itself | App-level: destination file size check after each copy, plus an opt-in (`--verify-checksum`) SHA256 comparison against the source's already-computed inventory checksum |
+| Tiered storage | Yes — Glacier/Deep Archive preflight + restore-request flow | No such concept; Globus collections aren't tiered | No such concept; local objects are always immediately available |
+| Auth | AWS profile / env creds (`boto3` default chain) | Native App OAuth device flow, cached refresh token (`globus_auth.py`) | None — just filesystem permissions on `dest_dir` |
+| Path model | Global flat key namespace (`s3_key`) | Collection-relative paths (`globus_path`); local paths must be mapped via `--source-mount`/`--dest-mount` (`globus_transfer.local_path_to_collection_relative()`) — everything you touch (source dir, scratch dir, inventory file, restore dir) must live under the configured mount, or `require_under_mount()` exits with an error | Ordinary filesystem paths (`local_path`, relative to `local_dest_dir`) — `dest_dir` must already be mounted and reachable; this tool never mounts anything itself |
+| Restore of tar objects | Downloaded to `--scratch-dir`, then extracted | Downloaded (via transfer task) to `--scratch-dir`, then extracted | Extracted directly from its location under `local_dest_dir` — no scratch-dir copy at all, since the object is already local |
+| Config resolution | CLI flag → `[s3]` config section → error, via `archive_config.resolve()`/`require()` (`archive_config.py:38`); no env-var step, and only `bucket`/`object_path`/`profile`/`endpoint_url`/`storage_class` are config-fillable | CLI flag → env var → `[globus]` config section → error, via `globus_config.resolve()`/`require()`, now a thin wrapper around `archive_config.py` (`globus_config.py:18`) | CLI flag → `[local]` config section → error, via `archive_config.resolve()`/`require()`; no env-var step, only `dest_dir` is config-fillable |
 
 ## The `browse_inventory.py` TUI
 
@@ -524,12 +599,37 @@ mutate data they exclusively own (one file record, one job dict), so there's
 no locking anywhere in the codebase — correctness relies on that invariant
 holding, not on any synchronization primitive.
 
+One exception to "each worker only touches data it owns": tar extraction
+during a restore writes into a *shared* filesystem namespace — the restore
+tree — not an exclusively-owned data structure, so two workers restoring
+different tar objects that both need an as-yet-uncreated shared parent
+directory (e.g. two tar groups that both contain files under `b/`) can
+genuinely race on creating it. `tarfile.TarFile._extract_member()`'s
+directory creation is a non-atomic check-then-create (`if not
+os.path.exists(upperdirs): os.makedirs(upperdirs)`, no `exist_ok`) for a
+member's parent directories, so the losing thread raises `FileExistsError`
+even though nothing is actually wrong (directory-type members don't have
+this problem — tarfile's own `makedir()` already catches
+`FileExistsError`). `_extract_member()` in `archive_common.py` (not to be
+confused with the stdlib method of the same name) wraps `tar.extract()`
+and retries once on `FileExistsError` — safe because by the time the
+exception fires, the directory has already been created by the winning
+thread, so the retry's `exists()` check passes and it proceeds normally.
+This is the one place in the codebase where concurrent workers can observe
+each other's side effects, and a retry (not a lock) is enough to make it
+safe.
+
 ## Developing/testing without cloud credentials
 
 `archive_common.py` has no `boto3`/`globus_sdk` dependency, so you can
 exercise most of the interesting logic — inventory building, the rollup,
 gzip round-tripping, `browse_inventory.py`'s tree/selection/script logic —
-without any credentials at all:
+without any credentials at all. `archive_to_local.py`/`restore_from_local.py`
+take this further: they're a fully real backend (real copies, real
+inventory, real restore) with no SDK dependency and no credentials needed
+at all — just a writable directory to use as `dest_dir` — making them the
+easiest way to exercise a genuine end-to-end archive/restore round trip
+while developing, including the tar-grouping and multi-worker-restore paths.
 
 ```python
 import archive_common as ac

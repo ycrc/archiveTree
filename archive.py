@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Unified archive entrypoint: picks a backend (s3 or globus) via --backend or
-the [archive] section of a config file, then dispatches straight into that
-backend's existing archive_to_s3.py / archive_to_globus.py logic.
+Unified archive entrypoint: picks a backend (s3, globus, or local) via
+--backend or the [archive] section of a config file, then dispatches
+straight into that backend's existing archive_to_s3.py / archive_to_globus.py
+/ archive_to_local.py logic.
 
-This is a thin dispatcher, not a merged implementation -- S3 and Globus have
-fundamentally different transfer execution models (S3 uploads per-object in
-parallel; Globus submits one or a few async, server-managed transfer tasks),
-so the actual work stays in the two backend-specific scripts. Once the
+This is a thin dispatcher, not a merged implementation -- S3, Globus, and
+local have fundamentally different transfer execution models (S3 uploads
+per-object in parallel; Globus submits one or a few async, server-managed
+transfer tasks; local copies per-object in parallel to a mounted directory),
+so the actual work stays in the three backend-specific scripts. Once the
 backend is known, every other flag (including --config-file, which the
 backend script re-resolves against its own config section) is handled
 exactly as if that backend's script had been invoked directly.
@@ -18,6 +20,7 @@ import sys
 
 import archive_config
 import archive_to_globus
+import archive_to_local
 import archive_to_s3
 
 
@@ -83,22 +86,22 @@ def main(argv=None):
     if err or backend is None:
         if not err and ("-h" in remaining or "--help" in remaining):
             print(
-                "usage: archive.py [--backend {s3,globus}] [--config-file PATH] directory ...\n\n"
-                "No backend selected yet -- pass --backend s3|globus, or set "
+                "usage: archive.py [--backend {s3,globus,local}] [--config-file PATH] directory ...\n\n"
+                "No backend selected yet -- pass --backend s3|globus|local, or set "
                 f"'backend' in the [archive] section of {config_path}, then "
                 "re-run with --help to see that backend's full flag list."
             )
             sys.exit(0)
         print(
             err or (
-                "ERROR: no backend specified. Pass --backend {s3,globus} or set "
+                "ERROR: no backend specified. Pass --backend {s3,globus,local} or set "
                 f"'backend' in the [archive] section of {config_path}."
             ),
             file=sys.stderr,
         )
         sys.exit(1)
 
-    backend_mod = {"s3": archive_to_s3, "globus": archive_to_globus}[backend]
+    backend_mod = {"s3": archive_to_s3, "globus": archive_to_globus, "local": archive_to_local}[backend]
     backend_parser = backend_mod.build_arg_parser()
     backend_parser.set_defaults(config_file=config_path)
 

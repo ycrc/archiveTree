@@ -68,7 +68,7 @@ def require(value, description, cli_flag, env_var, config_key):
     return value
 
 
-def resolve_backend(cli_backend, archive_section, valid=("s3", "globus")):
+def resolve_backend(cli_backend, archive_section, valid=("s3", "globus", "local")):
     """
     Determine which backend to use: CLI --backend > config [archive]
     'backend' key.
