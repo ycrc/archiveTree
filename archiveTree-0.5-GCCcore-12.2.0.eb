@@ -1,0 +1,57 @@
+easyblock = 'PythonPackage'
+
+name = 'archiveTree'
+version = '0.5'
+
+homepage = 'https://github.com/ycrc/archiveTree'
+description = """Archive directory trees to Amazon S3, a Globus collection,
+or a locally-mounted directory as size-grouped tar objects, with per-file
+checksums, symlink/permission preservation, and inventory-driven restore
+tooling (including an ncdu-style interactive browser for selective
+restores)."""
+
+toolchain = {'name': 'GCCcore', 'version': '12.2.0'}
+
+source_urls = ['https://github.com/ycrc/archiveTree/archive/refs/tags/']
+sources = ['%(version)s.tar.gz']
+#checksums = []  # TODO: fill in sha256 of the 0.2.tar.gz release archive
+
+# All GCCcore-12.2.0-generation modules already available on this cluster;
+# globus-sdk itself has no standalone module here and is only provided as
+# an extension of Globus-CLI.
+dependencies = [
+    ('Python', '3.10.8'),
+    ('boto3', '1.26.163'),
+    ('tqdm', '4.64.1'),
+    ('Globus-CLI', '3.30.1'),  # provides globus-sdk 3.44.0 as an extension
+]
+
+download_dep_fail = True
+use_pip = True
+sanity_pip_check = True
+
+options = {'modulename': False}  # not a single importable package, see below
+
+sanity_check_paths = {
+    'files': ['bin/archive-to-s3', 'bin/restore-from-s3',
+              'bin/archive-to-globus', 'bin/restore-from-globus',
+              'bin/archive-to-local', 'bin/restore-from-local',
+              'bin/archive', 'bin/restore',
+              'bin/browse-inventory', 'bin/list-object-status'],
+    'dirs': ['lib/python%(pyshortver)s/site-packages'],
+}
+
+sanity_check_commands = [
+    "archive-to-s3 --help",
+    "restore-from-s3 --help",
+    "archive-to-globus --help",
+    "restore-from-globus --help",
+    "archive-to-local --help",
+    "restore-from-local --help",
+    "archive --help",
+    "restore --help",
+    "browse-inventory --help",
+    "list-object-status --help",
+]
+
+moduleclass = 'tools'
