@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "archiveTree"
-version = "0.2"
-description = "Archive directory trees to Amazon S3 or a Globus collection as size-grouped tar objects, and browse/restore from the resulting inventory."
+version = "0.4"
+description = "Archive directory trees to Amazon S3, a Globus collection, or a locally-mounted directory as size-grouped tar objects, and browse/restore from the resulting inventory."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -22,16 +22,25 @@ archive-to-s3 = "archive_to_s3:main"
 restore-from-s3 = "restore_from_s3:main"
 archive-to-globus = "archive_to_globus:main"
 restore-from-globus = "restore_from_globus:main"
+archive-to-local = "archive_to_local:main"
+restore-from-local = "restore_from_local:main"
+archive = "archive:main"
+restore = "restore:main"
 browse-inventory = "browse_inventory:main"
 list-object-status = "list_object_status:main"
 
 [tool.setuptools]
 py-modules = [
     "archive_common",
+    "archive_config",
     "archive_to_s3",
     "restore_from_s3",
     "archive_to_globus",
     "restore_from_globus",
+    "archive_to_local",
+    "restore_from_local",
+    "archive",
+    "restore",
     "globus_auth",
     "globus_config",
     "globus_transfer",
