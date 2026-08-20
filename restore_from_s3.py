@@ -37,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 from botocore.exceptions import ClientError
 
+import archive_config
 from archive_common import (
     vprint,
     select_relpaths,
@@ -425,7 +426,7 @@ def download_file_from_s3(
 
 # ---------- Main ----------
 
-def main():
+def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Restore a directory tree from an inventory file and S3 archive."
     )
@@ -442,6 +443,13 @@ def main():
         "--endpoint-url",
         default=None,
         help="Custom S3 endpoint URL (for S3-compatible storage)."
+    )
+    parser.add_argument(
+        "--config-file", default=None,
+        help=(
+            "Path to config file with an [s3] section supplying defaults "
+            f"for profile/endpoint_url (default: {archive_config.DEFAULT_CONFIG_FILE})."
+        ),
     )
     parser.add_argument(
         "--scratch-dir",
@@ -529,8 +537,16 @@ def main():
         help="Print progress messages and show progress bars (if tqdm is installed)."
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+def run(args):
     verbose = args.verbose
+
+    config_path = os.path.expanduser(args.config_file or archive_config.DEFAULT_CONFIG_FILE)
+    s3_config = archive_config.load_config_file(config_path, section="s3")
+    profile = args.profile or s3_config.get("profile")
+    endpoint_url = args.endpoint_url or s3_config.get("endpoint_url")
 
     # Load inventory
     inv_path = os.path.abspath(args.inventory_file)
@@ -549,6 +565,15 @@ def main():
     archive = inventory.get("archive")
     if not archive:
         print("ERROR: Inventory file does not contain 'archive' section.", file=sys.stderr)
+        sys.exit(1)
+
+    if archive.get("backend") not in (None, "s3"):
+        print(
+            f"ERROR: This inventory was not produced by archive_to_s3.py "
+            f"(archive.backend={archive.get('backend')!r}). Use restore_from_globus.py "
+            "for Globus-backed inventories.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     bucket = archive.get("s3_bucket")
@@ -647,7 +672,7 @@ def main():
     vprint(verbose, f"Restoring into directory: {restore_root}")
 
     # S3 client
-    s3_client = get_s3_client(profile=args.profile, endpoint_url=args.endpoint_url)
+    s3_client = get_s3_client(profile=profile, endpoint_url=endpoint_url)
 
     # Build jobs for parallel restore
     jobs = []
@@ -769,6 +794,10 @@ def main():
             vprint(verbose, f"  {t}")
 
     print("Restore completed successfully.")
+
+
+def main():
+    run(build_arg_parser().parse_args())
 
 
 if __name__ == "__main__":

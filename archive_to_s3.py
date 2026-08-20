@@ -20,6 +20,28 @@ Deep Glacier–aware:
 - The storage class for each object is recorded in the inventory.
 - Verification uses head_object only (safe for Glacier classes).
 
+Checksum verification:
+
+- By default, each uploaded object is verified with a whole-object S3
+  checksum (ChecksumAlgorithm=CRC64NVME, ChecksumType=FULL_OBJECT), read
+  back via head_object(ChecksumMode=ENABLED) and compared against a CRC64NVME
+  computed locally just before upload. This works even for Glacier storage
+  classes, since it never reads the object body back.
+- CRC64NVME (not the SHA256 already in the inventory) is used because S3
+  only supports whole-object checksums for multipart uploads with the CRC
+  family of algorithms (CRC32/CRC32C/CRC64NVME); SHA256/SHA1 multipart
+  checksums are always composite (a hash of per-part hashes), which can't be
+  compared against a single hash of the whole local file. Since nearly
+  everything this tool uploads is large enough to go through multipart
+  upload, SHA256 verification would rarely apply in practice.
+- Computing CRC64NVME requires the optional `awscrt` package. If it isn't
+  installed, or the target endpoint doesn't support whole-object checksums
+  (probed with a tiny throwaway object before doing any real work),
+  archiveTree automatically falls back to size-only verification and prints
+  a warning.
+- Pass --no-checksum-verify to skip the probe and always use size-only
+  verification.
+
 Parallel:
 
 - Large-file uploads and tar-group uploads are done in parallel using a
@@ -27,14 +49,19 @@ Parallel:
 """
 
 import argparse
+import base64
+import io
 import os
 import sys
 import shutil
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
+import archive_config
 from archive_common import (
     vprint,
     build_inventory,
@@ -50,7 +77,45 @@ try:
 except ImportError:
     tqdm = None
 
+# Optional awscrt, required to compute CRC64NVME checksums locally (S3's
+# boto3 SDK also needs it to compute CRC64NVME on the wire, so if it's
+# missing here it's missing there too, and whole-object checksums degrade
+# to size-only verification).
+try:
+    from awscrt import checksums as crt_checksums
+except ImportError:
+    crt_checksums = None
+
 GLACIER_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"}
+
+
+def compute_crc64nvme_b64(path, verbose=False, use_tqdm=True):
+    """
+    Compute the CRC64NVME checksum of a local file, base64-encoded to match
+    S3's ChecksumCRC64NVME response field.
+    """
+    filesize = os.path.getsize(path)
+    crc = 0
+
+    show_bar = verbose and tqdm and use_tqdm
+    pbar = tqdm(total=filesize, unit="B", unit_scale=True,
+                desc=f"crc64nvme {os.path.basename(path)}") if show_bar else None
+
+    chunk_size = 8 * 1024 * 1024
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            crc = crt_checksums.crc64nvme(chunk, crc) & 0xFFFFFFFFFFFFFFFF
+            if pbar:
+                pbar.update(len(chunk))
+
+    if pbar:
+        pbar.close()
+
+    digest = crc.to_bytes(8, byteorder="big")
+    return base64.b64encode(digest).decode("ascii")
 
 
 # ---------- S3 + Progress ----------
@@ -92,16 +157,103 @@ def get_s3_client(profile=None, endpoint_url=None):
     return session.client("s3")
 
 
-def upload_file_to_s3(path, bucket, key, storage_class, s3_client,
-                      verbose=False, label="Upload"):
+def probe_checksum_support(s3_client, bucket, object_path, verbose=False):
     """
-    Upload a local file to S3 with progress and verify size.
+    Determine whether the target S3 endpoint supports whole-object CRC64NVME
+    checksums (ChecksumAlgorithm=CRC64NVME, ChecksumType=FULL_OBJECT) by
+    uploading and verifying a tiny throwaway object, then deleting it.
+
+    The probe forces the upload through the *multipart* code path (via a
+    near-zero multipart_threshold), even though the payload is tiny. This
+    matters: a plain single-part PutObject is always a genuine whole-object
+    checksum with no ambiguity (and doesn't even accept ChecksumType), but
+    real archive objects from this tool are almost always large enough to
+    go through multipart upload, where ChecksumType=FULL_OBJECT is what
+    determines whether S3 returns a true whole-object checksum instead of a
+    composite hash-of-part-hashes that won't match the locally computed
+    value. Testing the single-part path would give a false positive.
+
+    This is a capability probe, not a data-integrity check: any failure
+    (unsupported params, unexpected response shape, network hiccup) is
+    treated as "not supported" so the archive run can fall back to
+    size-only verification instead of aborting. Real per-object checksum
+    failures during the actual archive are handled separately in
+    upload_file_to_s3(), which raises instead of swallowing errors.
+
+    Returns True if whole-object CRC64NVME checksums are supported.
+    """
+    opath = object_path.strip("/")
+    prefix = f"{opath}/.archiveTree-probe" if opath else ".archiveTree-probe"
+    probe_key = f"{prefix}-{uuid.uuid4().hex}"
+    probe_body = b"archiveTree checksum capability probe"
+    expected_crc = crt_checksums.crc64nvme(probe_body, 0) & 0xFFFFFFFFFFFFFFFF
+    expected_b64 = base64.b64encode(expected_crc.to_bytes(8, byteorder="big")).decode("ascii")
+
+    vprint(verbose, "Probing S3 endpoint for whole-object CRC64NVME checksum support...")
+
+    # multipart_chunksize must still meet S3's 5MB minimum part size even
+    # though our one and only part is much smaller than that (a single part
+    # is always allowed to be the "last part", which has no minimum size).
+    force_multipart = TransferConfig(
+        multipart_threshold=1, multipart_chunksize=5 * 1024 * 1024
+    )
+
+    supported = False
+    try:
+        s3_client.upload_fileobj(
+            io.BytesIO(probe_body),
+            bucket,
+            probe_key,
+            ExtraArgs={"ChecksumAlgorithm": "CRC64NVME", "ChecksumType": "FULL_OBJECT"},
+            Config=force_multipart,
+        )
+        resp = s3_client.head_object(Bucket=bucket, Key=probe_key, ChecksumMode="ENABLED")
+        remote_b64 = resp.get("ChecksumCRC64NVME")
+        if remote_b64 == expected_b64:
+            supported = True
+        else:
+            vprint(
+                verbose,
+                "Checksum probe: endpoint did not return a matching whole-object "
+                "CRC64NVME checksum.",
+            )
+    except Exception as e:
+        vprint(verbose, f"Checksum probe failed, treating as unsupported: {e}")
+    finally:
+        try:
+            s3_client.delete_object(Bucket=bucket, Key=probe_key)
+        except Exception:
+            pass
+
+    return supported
+
+
+def upload_file_to_s3(path, bucket, key, storage_class, s3_client,
+                      verbose=False, label="Upload",
+                      expected_checksum=None, strict_checksum=False):
+    """
+    Upload a local file to S3 with progress, then verify it.
+
+    If strict_checksum is True, the object is uploaded with a whole-object
+    CRC64NVME checksum (ChecksumAlgorithm=CRC64NVME, ChecksumType=FULL_OBJECT)
+    and verified against expected_checksum (base64, matching S3's
+    ChecksumCRC64NVME format) via head_object(ChecksumMode=ENABLED).
+    Otherwise, only the remote size is verified via head_object (as before).
+
+    Both verification modes use head_object only, so they're safe for
+    Glacier storage classes (never reads the object body back).
 
     Returns:
         storage_class_actual (str): StorageClass from HEAD (for inventory).
         size_remote (int): ContentLength from HEAD.
     """
+    if strict_checksum and expected_checksum is None:
+        raise ValueError("strict_checksum=True requires expected_checksum")
+
     extra_args = {"StorageClass": storage_class}
+    if strict_checksum:
+        extra_args["ChecksumAlgorithm"] = "CRC64NVME"
+        extra_args["ChecksumType"] = "FULL_OBJECT"
 
     vprint(verbose, f"Uploading {path} to s3://{bucket}/{key} "
                     f"(StorageClass={storage_class}) ...")
@@ -120,8 +272,11 @@ def upload_file_to_s3(path, bucket, key, storage_class, s3_client,
     progress.close()
 
     # Verify via HEAD (safe even for Glacier classes)
+    head_kwargs = {"Bucket": bucket, "Key": key}
+    if strict_checksum:
+        head_kwargs["ChecksumMode"] = "ENABLED"
     try:
-        resp = s3_client.head_object(Bucket=bucket, Key=key)
+        resp = s3_client.head_object(**head_kwargs)
     except ClientError as e:
         raise RuntimeError(f"Verification head_object failed for s3://{bucket}/{key}: {e}") from e
 
@@ -134,6 +289,21 @@ def upload_file_to_s3(path, bucket, key, storage_class, s3_client,
             f"Verification failed for s3://{bucket}/{key}: "
             f"local {local_size} != remote {remote_size}"
         )
+
+    if strict_checksum:
+        remote_checksum = resp.get("ChecksumCRC64NVME")
+        if not remote_checksum:
+            raise RuntimeError(
+                f"Checksum verification failed for s3://{bucket}/{key}: "
+                "no ChecksumCRC64NVME returned despite ChecksumMode=ENABLED "
+                "(unexpected after a successful capability probe)."
+            )
+        if remote_checksum != expected_checksum:
+            raise RuntimeError(
+                f"Checksum verification FAILED for s3://{bucket}/{key}: "
+                f"expected crc64nvme={expected_checksum}, got {remote_checksum}."
+            )
+        vprint(verbose, f"Verified CRC64NVME checksum for s3://{bucket}/{key}.")
 
     if remote_storage_class in GLACIER_CLASSES:
         vprint(
@@ -150,15 +320,21 @@ def upload_file_to_s3(path, bucket, key, storage_class, s3_client,
 
 # ---------- Main ----------
 
-def main():
+def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Archive a directory tree to multiple S3 objects."
     )
     parser.add_argument("directory")
-    parser.add_argument("bucket")
     parser.add_argument(
-        "object_path",
-        help="Base S3 prefix under which archive objects will be stored."
+        "bucket", nargs="?", default=None,
+        help="S3 bucket name. Optional if 'bucket' is set in the [s3] "
+             "section of the config file.",
+    )
+    parser.add_argument(
+        "object_path", nargs="?", default=None,
+        help="Base S3 prefix under which archive objects will be stored. "
+             "Optional if 'object_path' is set in the [s3] section of the "
+             "config file.",
     )
     parser.add_argument(
         "--storage-class",
@@ -176,7 +352,27 @@ def main():
     )
     parser.add_argument("--profile", default=None)
     parser.add_argument("--endpoint-url", default=None)
+    parser.add_argument(
+        "--config-file", default=None,
+        help=(
+            "Path to config file with an [s3] section supplying defaults for "
+            "bucket/object_path/profile/endpoint_url/storage_class "
+            f"(default: {archive_config.DEFAULT_CONFIG_FILE})."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--no-checksum-verify", action="store_true",
+        help=(
+            "Skip the whole-object CRC64NVME checksum verification (and its "
+            "startup capability probe) and use size-only verification "
+            "instead, like archiveTree did before this feature existed. "
+            "archiveTree normally detects lack of support (missing awscrt, "
+            "or an endpoint that doesn't support it) automatically and "
+            "falls back on its own, so you should only need this if the "
+            "probe itself is problematic for your endpoint."
+        ),
+    )
     parser.add_argument(
         "--size-cutoff",
         type=int,
@@ -222,8 +418,30 @@ def main():
         help="Print a summary of files, bytes, and objects created.",
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+def run(args):
     verbose = args.verbose
+
+    config_path = os.path.expanduser(args.config_file or archive_config.DEFAULT_CONFIG_FILE)
+    s3_config = archive_config.load_config_file(config_path, section="s3")
+
+    bucket = archive_config.require(
+        archive_config.resolve(args.bucket, None, s3_config, "bucket"),
+        "S3 bucket", "bucket (positional)", None, "bucket",
+    )
+    object_path = archive_config.require(
+        archive_config.resolve(args.object_path, None, s3_config, "object_path"),
+        "S3 object path", "object_path (positional)", None, "object_path",
+    )
+    profile = args.profile or s3_config.get("profile")
+    endpoint_url = args.endpoint_url or s3_config.get("endpoint_url")
+    storage_class = (
+        args.storage_class
+        if args.storage_class != "STANDARD" or "storage_class" not in s3_config
+        else s3_config.get("storage_class")
+    )
 
     root_dir = os.path.abspath(args.directory)
 
@@ -250,12 +468,12 @@ def main():
         )
         sys.exit(1)
 
-    s3_client = get_s3_client(args.profile, args.endpoint_url)
+    s3_client = get_s3_client(profile, endpoint_url)
 
     valid_storage_classes = s3_client.meta.service_model.shape_for("StorageClass").enum
-    if args.storage_class not in valid_storage_classes:
+    if storage_class not in valid_storage_classes:
         print(
-            f"ERROR: --storage-class {args.storage_class!r} is not valid. "
+            f"ERROR: --storage-class {storage_class!r} is not valid. "
             f"Choose from: {', '.join(sorted(valid_storage_classes))}",
             file=sys.stderr,
         )
@@ -264,16 +482,46 @@ def main():
     # Verify credentials and bucket access now, before building the inventory
     # or any tars, so a bad --profile/--endpoint-url/bucket fails fast instead
     # of after a long run. Skipped on --dry-run, which never touches S3.
+    strict_checksum = False
     if not args.dry_run:
         try:
-            s3_client.head_bucket(Bucket=args.bucket)
+            s3_client.head_bucket(Bucket=bucket)
         except Exception as e:
             print(
-                f"ERROR: cannot access bucket {args.bucket!r} (check --profile, "
+                f"ERROR: cannot access bucket {bucket!r} (check --profile, "
                 f"--endpoint-url, AWS credentials, and bucket name/permissions): {e}",
                 file=sys.stderr,
             )
             sys.exit(1)
+
+        if args.no_checksum_verify:
+            vprint(verbose, "Checksum verification disabled via --no-checksum-verify; "
+                            "using size-only upload verification.")
+        elif crt_checksums is None:
+            print(
+                "WARNING: the 'awscrt' package is not installed, so whole-object "
+                "CRC64NVME checksums can't be computed locally. Falling back to "
+                "size-only upload verification. Install awscrt (or pass "
+                "--no-checksum-verify to silence this warning) to enable strict "
+                "checksum verification before delete.",
+                file=sys.stderr,
+            )
+        else:
+            strict_checksum = probe_checksum_support(
+                s3_client, bucket, object_path, verbose=verbose
+            )
+            if strict_checksum:
+                vprint(verbose, "Endpoint supports whole-object CRC64NVME checksums; "
+                                "will verify each uploaded object against it.")
+            else:
+                print(
+                    "WARNING: target S3 endpoint does not appear to support "
+                    "whole-object CRC64NVME checksums (ChecksumAlgorithm=CRC64NVME, "
+                    "ChecksumType=FULL_OBJECT). Falling back to size-only "
+                    "upload verification. Pass --no-checksum-verify to skip "
+                    "this probe on future runs against this endpoint.",
+                    file=sys.stderr,
+                )
 
     vprint(verbose, "Building inventory...")
     inventory, _ = build_inventory(root_dir, verbose=verbose,
@@ -295,7 +543,7 @@ def main():
     # Base S3 prefix: {object_path}/{root_name}/{archive_id}
     base_name = os.path.basename(root_dir.rstrip(os.sep))
     archive_id = inventory["inventory_id"]
-    opath = args.object_path.strip("/")
+    opath = object_path.strip("/")
 
     if opath:
         base_prefix = f"{opath}/{base_name}/{archive_id}"
@@ -348,14 +596,21 @@ def main():
             key = f"{base_prefix}/files/{rel}"
             key = key.replace("//", "/")
 
+            file_crc64nvme = None
+            if strict_checksum:
+                vprint(verbose, f"[worker] Hashing {rel} (CRC64NVME)...")
+                file_crc64nvme = compute_crc64nvme_b64(abs_path, verbose=verbose, use_tqdm=False)
+
             storage_class_actual, size_remote = upload_file_to_s3(
                 abs_path,
-                args.bucket,
+                bucket,
                 key,
-                args.storage_class,
+                storage_class,
                 s3_client,
                 verbose=verbose,
                 label=f"Upload {rel}",
+                expected_checksum=file_crc64nvme,
+                strict_checksum=strict_checksum,
             )
 
             obj_meta = {
@@ -366,6 +621,8 @@ def main():
                 "storage_class": storage_class_actual,
                 "relative_path": rel,
             }
+            if file_crc64nvme is not None:
+                obj_meta["crc64nvme"] = file_crc64nvme
 
             rec["object_id"] = obj_id
             rec["object_type"] = "file"
@@ -392,14 +649,21 @@ def main():
             key = f"{base_prefix}/groups/{tar_name}"
             key = key.replace("//", "/")
 
+            tar_crc64nvme = None
+            if strict_checksum:
+                vprint(verbose, f"[worker] Hashing tar for group {g_idx} (CRC64NVME)...")
+                tar_crc64nvme = compute_crc64nvme_b64(tar_path, verbose=verbose, use_tqdm=False)
+
             storage_class_actual, size_remote = upload_file_to_s3(
                 tar_path,
-                args.bucket,
+                bucket,
                 key,
-                args.storage_class,
+                storage_class,
                 s3_client,
                 verbose=verbose,
                 label=f"Upload group {g_idx}",
+                expected_checksum=tar_crc64nvme,
+                strict_checksum=strict_checksum,
             )
 
             obj_meta = {
@@ -411,6 +675,8 @@ def main():
                 "file_count": len(group),
                 "group_index": g_idx,
             }
+            if tar_crc64nvme is not None:
+                obj_meta["crc64nvme"] = tar_crc64nvme
 
             for rec in group:
                 rec["object_id"] = obj_id
@@ -457,7 +723,9 @@ def main():
     invpath = os.path.join(inv_dir, invname)
 
     # Always write the inventory file locally, once uploads have succeeded
-    write_inventory_file(inventory, {"s3_bucket": args.bucket}, objects, invpath, verbose=verbose)
+    write_inventory_file(
+        inventory, {"backend": "s3", "s3_bucket": bucket}, objects, invpath, verbose=verbose
+    )
 
     # Also upload the inventory file to S3 using STANDARD storage class,
     # under the same archive prefix, in an "inventory" subdir:
@@ -465,16 +733,19 @@ def main():
     inv_s3_key = f"{base_prefix}/inventory/{invname}"
     inv_s3_key = inv_s3_key.replace("//", "/")
 
-    vprint(verbose, f"Uploading inventory to s3://{args.bucket}/{inv_s3_key} "
+    vprint(verbose, f"Uploading inventory to s3://{bucket}/{inv_s3_key} "
                     f"(StorageClass=STANDARD) ...")
+    inv_crc64nvme = compute_crc64nvme_b64(invpath, verbose=verbose, use_tqdm=False) if strict_checksum else None
     _inv_storage_class, _inv_size = upload_file_to_s3(
         invpath,
-        args.bucket,
+        bucket,
         inv_s3_key,
         storage_class="STANDARD",           # always STANDARD for inventory
         s3_client=s3_client,
         verbose=verbose,
         label="Upload inventory",
+        expected_checksum=inv_crc64nvme,
+        strict_checksum=strict_checksum,
     )
 
     # Now (optionally) delete the original directory tree
@@ -498,6 +769,11 @@ def main():
         print(f"  Objects created:  {num_objects}")
 
     vprint(verbose, "Done.")
-    
+
+
+def main():
+    run(build_arg_parser().parse_args())
+
+
 if __name__ == "__main__":
     main()

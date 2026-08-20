@@ -45,7 +45,7 @@ from archive_common import (
 )
 
 
-def main():
+def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Archive a directory tree to a Globus collection."
     )
@@ -140,7 +140,10 @@ def main():
              "roughly one batch's worth of tars. Default: 1e11 (100GB).",
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+def run(args):
     verbose = args.verbose
 
     config_file = os.path.expanduser(
@@ -494,6 +497,10 @@ def main():
         print(f"  Objects created:  {num_objects}")
 
     vprint(verbose, "Done.")
+
+
+def main():
+    run(build_arg_parser().parse_args())
 
 
 if __name__ == "__main__":

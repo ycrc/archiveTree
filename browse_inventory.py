@@ -36,7 +36,7 @@ import shlex
 import sys
 from datetime import datetime
 
-from archive_common import check_inventory_version, load_inventory_file
+from archive_common import check_inventory_version, detect_backend, load_inventory_file
 
 SORT_MODES = ["name", "size-desc", "size-asc", "count-desc", "count-asc"]
 
@@ -229,11 +229,6 @@ def compute_touched_objects(inventory, marks):
     objs = [objects_by_id[oid] for oid in touched_ids if oid in objects_by_id]
     objs.sort(key=lambda o: -o.get("size_bytes", 0))
     return objs
-
-
-def detect_backend(inventory):
-    archive = inventory.get("archive") or {}
-    return "globus" if archive.get("backend") == "globus" else "s3"
 
 
 def restore_command_groups(inventory_path, inventory, dir_prefixes, file_paths,

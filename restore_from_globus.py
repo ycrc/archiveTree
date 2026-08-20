@@ -45,7 +45,7 @@ from archive_common import (
 )
 
 
-def main():
+def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Restore a directory tree from an inventory file and a Globus archive."
     )
@@ -150,7 +150,10 @@ def main():
         help="Print progress messages and show progress bars (if tqdm is installed).",
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+def run(args):
     verbose = args.verbose
 
     config_file = os.path.expanduser(
@@ -486,6 +489,10 @@ def main():
         )
 
     print("Restore completed successfully.")
+
+
+def main():
+    run(build_arg_parser().parse_args())
 
 
 if __name__ == "__main__":

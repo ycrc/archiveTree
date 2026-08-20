@@ -347,6 +347,12 @@ def extract_tar(tar_path, restore_root, selected_relpaths=None, verbose=False):
 
 # ---------- Restore-side selection / verification ----------
 
+def detect_backend(inventory):
+    """Return "globus" or "s3", based on inventory["archive"]["backend"]."""
+    archive = inventory.get("archive") or {}
+    return "globus" if archive.get("backend") == "globus" else "s3"
+
+
 def select_relpaths(inventory, only_paths=None, only_prefixes=None, verbose=False):
     """
     Determine which relative paths from the inventory to restore,

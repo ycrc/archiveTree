@@ -1,0 +1,16 @@
+[workspace]
+authors = ["Robert Bjornson <robert.bjornson@yale.edu>"]
+channels = ["conda-forge"]
+name = "archiveTree"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+archive = "python archive.py"
+restore = "python restore.py"
+
+[dependencies]
+boto3 = ">=1.43.73,<2"
+globus-sdk = ">=4.9.0,<5"
+tqdm = ">=4.70.0,<5"
+awscrt = ">=0.36.2,<0.37"
