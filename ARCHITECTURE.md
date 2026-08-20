@@ -10,11 +10,13 @@ for usage.
 
 | File | Role |
 |---|---|
-| `archive_common.py` | Transport-agnostic core: inventory building, tar create/extract, checksum verification, size partitioning/grouping, inventory JSON read/write. Imports neither `boto3` nor `globus_sdk`. |
-| `archive_to_s3.py` / `restore_from_s3.py` | S3 backend (via `boto3`). |
+| `archive_common.py` | Transport-agnostic core: inventory building, tar create/extract, checksum verification, size partitioning/grouping, inventory JSON read/write, `detect_backend()`. Imports neither `boto3` nor `globus_sdk`. |
+| `archive_to_s3.py` / `restore_from_s3.py` | S3 backend (via `boto3`), with optional `[s3]`-section config-file support. |
 | `archive_to_globus.py` / `restore_from_globus.py` | Globus Transfer backend. |
+| `archive.py` / `restore.py` | Thin dispatchers: pick a backend (s3/globus) via `--backend`, a config file, or (restore only) the inventory's own `archive.backend` field, then call straight into the matching backend script's `run()`. See [Unified entrypoints](#unified-entrypoints-archivepy--restorepy). |
 | `globus_auth.py` | Native App OAuth login flow + token cache, shared by the two Globus scripts. |
-| `globus_config.py` | CLI flag / env var / config-file precedence resolution for Globus settings. |
+| `archive_config.py` | Generalized CLI-flag / env-var / config-file precedence resolution, over a multi-section INI file (`[archive]`/`[s3]`/`[globus]`). Shared by all backend scripts and both dispatchers. |
+| `globus_config.py` | Thin backward-compatible wrapper around `archive_config.py`, scoped to the `[globus]` section — existing Globus scripts/config files need no changes. |
 | `globus_transfer.py` | `TransferData` construction, submission, and polling; local-path ↔ collection-relative-path mapping. |
 | `list_object_status.py` | Reports each S3 object's storage class / Glacier restore status for an inventory. |
 | `browse_inventory.py` | Interactive curses TUI for browsing an inventory and generating a restore script. |
@@ -34,13 +36,13 @@ paths from the object keys).
 
 ### On disk
 
-- Written by `write_inventory_file()` (`archive_common.py:568`), named
+- Written by `write_inventory_file()` (`archive_common.py:574`), named
   `<dirname>.inventory.<archive_id>.json.gz` by the two archive scripts.
 - Gzip-compressed by default (`gzip_output=True`). A copy is also uploaded/
   transferred to the backend itself, under `.../inventory/` in the same
   archive prefix — but that's a convenience/DR copy; the operative copy is
   the local one you pass to `restore_from_*.py`.
-- Read via `load_inventory_file()` (`archive_common.py:613`), which detects
+- Read via `load_inventory_file()` (`archive_common.py:619`), which detects
   gzip by magic bytes (`\x1f\x8b`), not by filename, so it transparently
   reads both new `.json.gz` files and the many pre-existing plain-text
   `.json` inventories written before compression was added.
@@ -153,18 +155,24 @@ tar-group jobs continue the *same* counter (`tar-000002`, `tar-000003`, ...)
 `archive` also carries backend-specific fields merged in by
 `write_inventory_file`'s `backend_meta` argument:
 
-- **S3**: `{"s3_bucket": bucket}`
+- **S3**: `{"backend": "s3", "s3_bucket": bucket}`
 - **Globus**: `{"backend": "globus", "globus_dest_collection": ..., "globus_dest_path": ..., "transfer_task_ids": [...]}`
 
-`restore_from_globus.py` uses the presence of `archive.backend == "globus"`
-as its own guard against being pointed at an S3 inventory
-(`restore_from_globus.py:178`); the S3 side is identified implicitly by the
-presence of `s3_bucket` instead of an explicit tag.
+Both restore scripts guard against being pointed at the wrong backend's
+inventory: `restore_from_globus.py` requires `archive.backend == "globus"`
+(`restore_from_globus.py:200`); `restore_from_s3.py` requires
+`archive.backend` to be absent or `"s3"` (`restore_from_s3.py:570`) — the
+"absent" case keeps inventories written before the `"backend"` key existed
+working. `archive_common.detect_backend()` (`archive_common.py:350`)
+implements the same `"globus" if archive.get("backend") == "globus" else
+"s3"` logic for callers (`browse_inventory.py`, `restore.py`) that need to
+*pick* a backend before dispatching, rather than just validating one after
+the fact.
 
 ### `format_version`
 
 A single top-level int, checked by `check_inventory_version()`
-(`archive_common.py:550`) right after loading, before anything else touches
+(`archive_common.py:556`) right after loading, before anything else touches
 the file:
 
 - **1** — no `format_version` key at all (every inventory written before
@@ -214,7 +222,7 @@ matters beyond just bytes transferred:
   `tarfile.chown()` only attempts `os.chown()` when running as root.
 - **Large files** (their own S3/Globus object): as of format_version 4,
   `download_file_from_s3()` (`restore_from_s3.py`) and the post-transfer
-  pass in `restore_from_globus.py:main()` explicitly `os.chmod()` the
+  pass in `restore_from_globus.py:run()` explicitly `os.chmod()` the
   restored file using the `mode` recorded in its inventory record. For an
   inventory written before format_version 4 (no `mode` field), this is
   skipped — the file just gets `open(..., "wb")`'s default permissions, as
@@ -249,22 +257,24 @@ only the upload/transfer mechanics differ.
 
 5. **Upload/transfer** (this is where the two backends diverge):
 
-   - **S3** (`archive_to_s3.py:317` `process_job`): each job — file or tar —
+   - **S3** (`archive_to_s3.py:588` `process_job`): each job — file or tar —
      is handled by one worker in a single `ThreadPoolExecutor`. A `"tar"`
      job calls `create_tar()` to build the tar *and* uploads it, all inside
      that one worker; `upload_file_to_s3()` uploads then immediately does a
      `head_object` to verify the remote size and record the actual storage
-     class. Each object is a synchronous `boto3` call.
+     class, plus — when supported — a whole-object CRC64NVME checksum
+     comparison (see [Upload checksum verification](#upload-checksum-verification-s3)
+     below). Each object is a synchronous `boto3` call.
 
    - **Globus** (`archive_to_globus.py`): transfer tasks are async and
      server-managed, so the flow is split into two decoupled passes.
      First, all tar groups are built *locally* in parallel
-     (`build_tar_job`, its own `ThreadPoolExecutor` pass, `:277`) — pure
+     (`build_tar_job`, its own `ThreadPoolExecutor` pass, `:303`) — pure
      local CPU/disk work, no network yet. Then every job (large files +
      built tars) is added as an item to one or more `TransferData` tasks
-     (`globus_transfer.batches()`, `--max-items-per-task`, default 10000)
-     and submitted via `globus_transfer.submit_and_wait()`, which polls
-     `task_wait()` until the task completes (`:339`).
+     (`globus_transfer.batches_by_count_and_bytes()`, `--max-items-per-task`,
+     default 10000) and submitted via `globus_transfer.submit_and_wait()`,
+     which polls `task_wait()` until the task completes (`:381`).
 
    Either way, each file's record gets `object_id`/`object_type`/
    `object_key` mutated onto it in place as jobs complete. This is safe
@@ -288,16 +298,63 @@ Both scripts support `--dry-run`, which stops after step 4 and prints a
 summary (file/object counts, bytes) without creating tars, uploading, or
 deleting anything.
 
+## Upload checksum verification (S3)
+
+Every `upload_file_to_s3()` call (`archive_to_s3.py:231`) verifies more than
+just size when possible: it asks S3 to compute a whole-object CRC64NVME
+checksum (`ChecksumAlgorithm=CRC64NVME`, `ChecksumType=FULL_OBJECT`) during
+upload, reads it back via `head_object(ChecksumMode=ENABLED)`, and compares
+it to a CRC64NVME computed locally over the same bytes just before upload
+(`compute_crc64nvme_b64()`, `archive_to_s3.py:92`). This catches silent
+corruption in transit that a size-only check would miss.
+
+**Why CRC64NVME, not the SHA256 already in the inventory:** S3 only
+supports whole-object checksums for *multipart* uploads with the CRC family
+of algorithms (CRC32 / CRC32C / CRC64NVME). SHA256 (and SHA1) multipart
+checksums are always *composite* — a hash of the per-part hashes, not a
+hash of the whole object — so they can never be compared against a single
+local hash of the whole file. Since almost everything this tool uploads
+(large files, and especially tar groups) is well above s3transfer's default
+multipart threshold, SHA256 verification would essentially never apply in
+practice; CRC64NVME is the only algorithm S3 lets you get a genuine
+whole-object checksum from for both single-part and multipart uploads.
+
+**Capability probe:** before doing any real work, `probe_checksum_support()`
+(`archive_to_s3.py:160`) uploads and verifies one tiny throwaway object,
+deliberately forced through the *multipart* code path
+(`TransferConfig(multipart_threshold=1, ...)`) even though the payload is
+tiny — testing the single-part path would give a false positive, since a
+plain `PutObject` is always a whole-object checksum regardless of
+algorithm. This decides `strict_checksum` for the whole run.
+
+**Graceful degradation** to size-only verification, with a printed warning,
+happens in two cases:
+
+- the `awscrt` package (needed to compute CRC64NVME locally — `boto3`
+  itself also needs it to compute CRC64NVME on the wire, so if it's missing
+  here it's missing there too) isn't installed;
+- the probe determines the target endpoint doesn't support whole-object
+  CRC64NVME checksums (e.g. an older or non-AWS S3-compatible service).
+
+`--no-checksum-verify` skips the probe entirely and always uses size-only
+verification. A genuine checksum *mismatch* during the real archive (as
+opposed to the probe, which only ever downgrades to size-only) raises and
+aborts the run before the source tree is deleted, same as any other upload
+failure.
+
 ## Restore flow
 
 `restore_from_s3.py` and `restore_from_globus.py` again share the same
 shape, diverging on transfer mechanics.
 
 1. **Load + validate**: `load_inventory_file()` then
-   `check_inventory_version()`, then a backend sanity check (S3 requires
-   `archive.s3_bucket`; Globus requires `archive.backend == "globus"`).
+   `check_inventory_version()`, then a backend guard — S3 requires
+   `archive.backend` to be absent or `"s3"` (`restore_from_s3.py:570`) and
+   also requires `archive.s3_bucket`; Globus requires
+   `archive.backend == "globus"` (`restore_from_globus.py:200`) — before
+   either script touches the objects themselves.
 
-2. **`select_relpaths()`** (`archive_common.py:350`) resolves `--only-path`
+2. **`select_relpaths()`** (`archive_common.py:356`) resolves `--only-path`
    (exact match, repeatable) and `--only-prefix` (repeatable) against
    `files[]`. With neither flag, everything is selected. **Note:**
    `--only-prefix` matching is a plain `str.startswith()` — not
@@ -343,7 +400,7 @@ shape, diverging on transfer mechanics.
      the S3 path where each worker does both.
 
 6. **Optional `--verify-checksums`**: `verify_restored_files()`
-   (`archive_common.py:380`) re-hashes every restored file (or symlink
+   (`archive_common.py:386`) re-hashes every restored file (or symlink
    target) and compares to the inventory's recorded `sha256`, raising on any
    `missing`/`checksum_mismatch`.
 
@@ -362,16 +419,73 @@ everything except what was asked for). `browse_inventory.py`'s summary line
 view exist specifically to make this cost visible before you commit to a
 restore — see below.
 
+## Unified entrypoints (`archive.py` / `restore.py`)
+
+`archive.py` and `restore.py` are thin dispatchers, not a merged
+implementation of the two backends — S3 and Globus have fundamentally
+different transfer execution models (S3: synchronous per-object calls in a
+`ThreadPoolExecutor`; Globus: one or a few async, server-managed transfer
+tasks), and collapsing them into one shared loop was deliberately avoided
+(see [S3 vs Globus differences](#s3-vs-globus-differences) below). What
+they unify is just the *entrypoint*: pick a backend, then hand off to that
+backend's existing, unmodified logic.
+
+This works because all four backend scripts (`archive_to_s3.py`,
+`archive_to_globus.py`, `restore_from_s3.py`, `restore_from_globus.py`) are
+each split into `build_arg_parser() -> argparse.ArgumentParser` and
+`run(args) -> None`, with a thin `main() = run(build_arg_parser().parse_args())`
+kept for fully backward-compatible standalone invocation. The dispatchers
+call `build_arg_parser()` and `run()` directly — in-process function calls,
+not a subprocess — so `archive.py --backend s3 ...` is behaviorally
+indistinguishable from calling `archive_to_s3.py ...` directly with the
+same flags.
+
+**Backend resolution** (`archive_config.resolve_backend()`): `--backend` on
+the command line, else the `backend` key in the config file's `[archive]`
+section, else — for `restore.py` only — auto-detected from the inventory
+file itself via `archive_common.detect_backend()`. The auto-detect path is
+best-effort: it assumes the first non-flag token in argv is the inventory
+path (`restore.py`'s `_guess_inventory_file()`); if that guess is wrong or
+the file isn't a readable inventory, detection just fails cleanly into the
+"could not determine backend" error rather than picking a wrong backend
+silently. `archive.py` has no such fallback, since there's no inventory
+file to inspect before archiving.
+
+**Why the dispatchers hand-parse `--backend`/`--config-file` instead of
+using `argparse.parse_known_args()`:** `extract_dispatch_flags()`
+(`archive.py`) does plain string matching for exactly those two flags and
+leaves everything else — including flags neither dispatcher has ever heard
+of, and their values — completely untouched, in original order, for the
+backend's own parser to consume. An `argparse.parse_known_args()`-based
+peek was tried first and turned out to be unsafe: since that parser doesn't
+know which unrecognized flags take a value, an invocation like
+`archive.py --backend s3 --storage-class GLACIER mydir` could misclassify
+`GLACIER` as the positional `directory` argument (it has no way to know
+`--storage-class` consumes the next token). Plain string matching on the
+two flags this module actually owns has no such ambiguity.
+
+**Config file**: the same physical file used by the Globus scripts today
+(default `~/.archive_globus.cfg`, overridable via `--config-file` /
+`GLOBUS_ARCHIVE_CONFIG`), generalized to hold multiple named INI sections —
+`[archive]` (`backend = s3|globus`), `[s3]`
+(`bucket`/`object_path`/`profile`/`endpoint_url`/`storage_class` for
+archiving, `profile`/`endpoint_url` for restoring), and the pre-existing
+`[globus]` section, unchanged. `archive_config.py` generalizes
+`globus_config.py`'s old CLI-flag/env-var/config-file precedence helpers to
+take a `section` argument; `globus_config.py` is now a thin wrapper around
+it, scoped to `[globus]`, kept purely for backward compatibility so
+existing Globus config files and call sites need zero changes.
+
 ## S3 vs Globus differences
 
 | | S3 | Globus |
 |---|---|---|
 | Transfer unit | Individual synchronous `boto3` calls, one per object | Batched async `TransferData` tasks (poll to completion) |
-| Verification | App-level: `head_object` size check after each upload | Server-side: `verify_checksum=True` / `sync_level="checksum"` on the transfer itself |
+| Verification | App-level: `head_object` size check after each upload, plus a whole-object CRC64NVME checksum comparison when supported (see [Upload checksum verification](#upload-checksum-verification-s3)) | Server-side: `verify_checksum=True` / `sync_level="checksum"` on the transfer itself |
 | Tiered storage | Yes — Glacier/Deep Archive preflight + restore-request flow | No such concept; Globus collections aren't tiered |
 | Auth | AWS profile / env creds (`boto3` default chain) | Native App OAuth device flow, cached refresh token (`globus_auth.py`) |
 | Path model | Global flat key namespace (`s3_key`) | Collection-relative paths (`globus_path`); local paths must be mapped via `--source-mount`/`--dest-mount` (`globus_transfer.local_path_to_collection_relative()`) — everything you touch (source dir, scratch dir, inventory file, restore dir) must live under the configured mount, or `require_under_mount()` exits with an error |
-| Config resolution | CLI flags only | CLI flag → env var → `~/.archive_globus.cfg` → error, via `globus_config.resolve()`/`require()` (`globus_config.py:31`) |
+| Config resolution | CLI flag → `[s3]` config section → error, via `archive_config.resolve()`/`require()` (`archive_config.py:38`); no env-var step, and only `bucket`/`object_path`/`profile`/`endpoint_url`/`storage_class` are config-fillable | CLI flag → env var → `[globus]` config section → error, via `globus_config.resolve()`/`require()`, now a thin wrapper around `archive_config.py` (`globus_config.py:18`) |
 
 ## The `browse_inventory.py` TUI
 
@@ -421,7 +535,7 @@ without any credentials at all:
 import archive_common as ac
 
 inventory, _paths = ac.build_inventory("/path/to/some/test/tree", max_workers=4)
-ac.write_inventory_file(inventory, {"s3_bucket": "fake-bucket"}, objects=[], inventory_path="test.inventory.json.gz")
+ac.write_inventory_file(inventory, {"backend": "s3", "s3_bucket": "fake-bucket"}, objects=[], inventory_path="test.inventory.json.gz")
 ```
 
 To get a realistic `archive.objects` list (with actual tar-group
