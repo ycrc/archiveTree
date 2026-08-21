@@ -107,6 +107,92 @@ def new_transfer(transfer_client, source_collection, destination_collection, lab
     )
 
 
+def _relogin_for_transfer_error(err, client_id=None,
+                                 token_cache=globus_auth.DEFAULT_TOKEN_CACHE,
+                                 login_domain=None, verbose=False):
+    """
+    Given a TransferAPIError, either recover by re-running the interactive
+    login and return a fresh TransferClient built from the updated token
+    cache, or re-raise if the error isn't one of the two kinds this can
+    recover from:
+
+    - ConsentRequired: re-runs the interactive login with the additionally
+      required scopes.
+    - session_required_single_domain (a collection restricting access to
+      identities from a specific institutional domain, e.g. a cached login
+      that predates --login-domain being set): re-runs the interactive
+      login requesting a session for that domain -- login_domain, if
+      given, picks which required domain to request when the server lists
+      more than one; otherwise the first one listed is used.
+    """
+    required_domains = (
+        err.info.authorization_parameters.session_required_single_domain
+        if err.info.authorization_parameters else None
+    )
+    if err.info.consent_required:
+        if not client_id:
+            raise RuntimeError(
+                "Globus requires additional consent for this operation, but no "
+                "client_id was provided to retry the login."
+            ) from err
+        print(
+            "Encountered a ConsentRequired error; you must login again to "
+            "grant additional consents.\n"
+        )
+        globus_auth.interactive_login(
+            client_id,
+            scopes=err.info.consent_required.required_scopes,
+            cache_path=token_cache,
+        )
+    elif required_domains:
+        if not client_id:
+            raise RuntimeError(
+                "This collection requires a login session from one of "
+                f"{required_domains}, but the cached login doesn't have one, "
+                "and no client_id was provided to retry the login."
+            ) from err
+        domain = login_domain or required_domains[0]
+        print(
+            f"Encountered a domain-restricted login error: this collection "
+            f"requires a session from one of {required_domains}. Logging in "
+            f"again, requesting an identity from {domain!r} (pass "
+            "--login-domain to choose a different one if needed)...\n"
+        )
+        globus_auth.interactive_login(
+            client_id, cache_path=token_cache, login_domain=domain,
+        )
+    else:
+        raise err
+
+    return globus_auth.get_transfer_client(
+        client_id, cache_path=token_cache, verbose=verbose
+    )
+
+
+def call_with_auth_retry(func, transfer_client, client_id=None,
+                          token_cache=globus_auth.DEFAULT_TOKEN_CACHE,
+                          login_domain=None, verbose=False):
+    """
+    Call func(transfer_client) and return (result, transfer_client) -- the
+    possibly-refreshed client, so callers can keep reusing it afterward.
+
+    On a ConsentRequired or session_required_single_domain
+    TransferAPIError, recovers the same way submit_and_wait() does (see
+    _relogin_for_transfer_error()) and retries func once with a fresh
+    client. Used for preflight collection-access checks (e.g.
+    operation_ls), which can hit the exact same recoverable errors a
+    transfer submission can, and should self-heal from them the same way.
+    """
+    try:
+        return func(transfer_client), transfer_client
+    except globus_sdk.TransferAPIError as err:
+        transfer_client = _relogin_for_transfer_error(
+            err, client_id=client_id, token_cache=token_cache,
+            login_domain=login_domain, verbose=verbose,
+        )
+        return func(transfer_client), transfer_client
+
+
 def submit_and_wait(transfer_client, transfer_data, client_id=None,
                      token_cache=globus_auth.DEFAULT_TOKEN_CACHE,
                      verbose=False, poll_interval=15,
@@ -114,16 +200,9 @@ def submit_and_wait(transfer_client, transfer_data, client_id=None,
     """
     Submit a TransferData task and block until it completes.
 
-    On a ConsentRequired error, re-runs the interactive login with the
-    additionally required scopes. On a session_required_single_domain error
-    (a collection restricting access to identities from a specific
-    institutional domain, e.g. a cached login that predates --login-domain
-    being set), re-runs the interactive login requesting a session for that
-    domain -- login_domain, if given, picks which required domain to
-    request when the server lists more than one; otherwise the first one
-    listed is used. Either way, this builds a fresh TransferClient from the
-    updated token cache and retries submission once with that client (which
-    is also used for the subsequent polling below).
+    Retries submission once via call_with_auth_retry() on a recoverable
+    auth error -- see that function's docstring. The (possibly refreshed)
+    client it returns is also used for the polling below.
 
     If verbose, tqdm is installed, and total_bytes is given, shows a
     tqdm progress bar driven by the task's cumulative bytes_transferred
@@ -132,51 +211,11 @@ def submit_and_wait(transfer_client, transfer_data, client_id=None,
     Returns the final task document (dict-like GlobusHTTPResponse).
     Raises RuntimeError if the task does not succeed.
     """
-    try:
-        submit_result = transfer_client.submit_transfer(transfer_data)
-    except globus_sdk.TransferAPIError as err:
-        required_domains = (
-            err.info.authorization_parameters.session_required_single_domain
-            if err.info.authorization_parameters else None
-        )
-        if err.info.consent_required:
-            if not client_id:
-                raise RuntimeError(
-                    "Globus requires additional consent for this transfer, but no "
-                    "client_id was provided to retry the login."
-                ) from err
-            print(
-                "Encountered a ConsentRequired error; you must login again to "
-                "grant additional consents.\n"
-            )
-            globus_auth.interactive_login(
-                client_id,
-                scopes=err.info.consent_required.required_scopes,
-                cache_path=token_cache,
-            )
-        elif required_domains:
-            if not client_id:
-                raise RuntimeError(
-                    "This collection requires a login session from one of "
-                    f"{required_domains}, but the cached login doesn't have one, "
-                    "and no client_id was provided to retry the login."
-                ) from err
-            domain = login_domain or required_domains[0]
-            print(
-                f"Encountered a domain-restricted login error: this collection "
-                f"requires a session from one of {required_domains}. Logging in "
-                f"again, requesting an identity from {domain!r} (pass "
-                "--login-domain to choose a different one if needed)...\n"
-            )
-            globus_auth.interactive_login(
-                client_id, cache_path=token_cache, login_domain=domain,
-            )
-        else:
-            raise
-        transfer_client = globus_auth.get_transfer_client(
-            client_id, cache_path=token_cache, verbose=verbose
-        )
-        submit_result = transfer_client.submit_transfer(transfer_data)
+    submit_result, transfer_client = call_with_auth_retry(
+        lambda tc: tc.submit_transfer(transfer_data),
+        transfer_client, client_id=client_id, token_cache=token_cache,
+        login_domain=login_domain, verbose=verbose,
+    )
 
     task_id = submit_result["task_id"]
     if verbose:

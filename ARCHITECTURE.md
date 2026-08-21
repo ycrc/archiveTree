@@ -274,6 +274,34 @@ matters beyond just bytes transferred:
 `archive_to_s3.py`, `archive_to_globus.py`, and `archive_to_local.py` all
 follow the same sequence; only the upload/transfer mechanics differ.
 
+**Preflight checks** run first, before any inventorying or tar-building,
+so a destination that can't actually be written to fails immediately
+instead of after however long walking and hashing the whole tree took.
+Skipped entirely on `--dry-run`, which never touches the destination:
+
+- **S3**: `s3_client.head_bucket()` confirms the bucket exists and is
+  reachable, then `probe_write_access()` (`archive_to_s3.py`) uploads and
+  deletes a tiny throwaway object under `object_path` to verify actual
+  `PutObject` permission — `head_bucket` alone only proves read-level
+  access to the bucket, not write access to the target prefix.
+- **Globus**: `transfer_client.operation_ls()` is called against both
+  `--source-mount` on the source collection and the root of the
+  destination collection, via `globus_transfer.call_with_auth_retry()`
+  (which self-heals from the same `ConsentRequired`/
+  `session_required_single_domain` errors `submit_and_wait()` handles —
+  see [Globus login error recovery](#globus-login-error-recovery) below).
+  The source-side check doubles as validation that `--source-mount` is
+  actually a real, listable path on that collection — the single most
+  common Globus setup mistake (see Troubleshooting in README.md). The
+  `TransferClient` obtained here is reused for the rest of the run rather
+  than re-fetched later.
+- **Local**: `probe_write_access()` (`archive_to_local.py`) creates and
+  removes a tiny throwaway file in `dest_dir`, rather than trusting
+  `os.access()`'s permission-bit check alone — which can be misleading
+  (e.g. running as root bypasses it) or miss real-world failure modes a
+  plain stat can't see, like a read-only NFS export or a full
+  filesystem/quota.
+
 1. **`build_inventory(root_dir)`** (`archive_common.py:144`) walks the tree
    once, computing every file's checksum in parallel (`ThreadPoolExecutor`,
    `--max-workers`), then rolls up per-directory stats. Returns the inventory
@@ -292,7 +320,7 @@ follow the same sequence; only the upload/transfer mechanics differ.
 
 5. **Upload/transfer** (this is where the three backends diverge):
 
-   - **S3** (`archive_to_s3.py:588` `process_job`): each job — file or tar —
+   - **S3** (`archive_to_s3.py:624` `process_job`): each job — file or tar —
      is handled by one worker in a single `ThreadPoolExecutor`. A `"tar"`
      job calls `create_tar()` to build the tar *and* uploads it, all inside
      that one worker; `upload_file_to_s3()` uploads then immediately does a
@@ -304,12 +332,12 @@ follow the same sequence; only the upload/transfer mechanics differ.
    - **Globus** (`archive_to_globus.py`): transfer tasks are async and
      server-managed, so the flow is split into two decoupled passes.
      First, all tar groups are built *locally* in parallel
-     (`build_tar_job`, its own `ThreadPoolExecutor` pass, `:303`) — pure
+     (`build_tar_job`, its own `ThreadPoolExecutor` pass, `:345`) — pure
      local CPU/disk work, no network yet. Then every job (large files +
      built tars) is added as an item to one or more `TransferData` tasks
      (`globus_transfer.batches_by_count_and_bytes()`, `--max-items-per-task`,
      default 10000) and submitted via `globus_transfer.submit_and_wait()`,
-     which polls `task_wait()` until the task completes (`:381`).
+     which polls `task_wait()` until the task completes (`:422`).
 
    - **Local** (`archive_to_local.py:process_job`): structurally identical
      to S3's model — each job, file or tar, is handled synchronously by one
@@ -348,9 +376,33 @@ Both scripts support `--dry-run`, which stops after step 4 and prints a
 summary (file/object counts, bytes) without creating tars, uploading, or
 deleting anything.
 
+## Globus login error recovery
+
+`globus_transfer._relogin_for_transfer_error(err, ...)` centralizes
+recovery from the two `TransferAPIError` kinds a Globus operation can hit
+that are fixable by logging in again rather than being fatal:
+
+- **`ConsentRequired`**: re-runs the interactive login with the
+  additionally required scopes (`err.info.consent_required.required_scopes`).
+- **`session_required_single_domain`**: a collection restricting access to
+  identities from a specific institutional domain (e.g. `yale.edu`); the
+  cached login predates `--login-domain` being set, or was never asked for
+  that domain. Re-runs the interactive login requesting a session for the
+  domain named in the error (or `--login-domain`, if given and the error
+  lists more than one acceptable domain).
+
+Either way it returns a fresh `TransferClient` built from the updated
+token cache; any other error is re-raised as-is. `call_with_auth_retry(func,
+transfer_client, ...)` wraps this into a generic "call this, and if it
+hits a recoverable auth error, relogin and retry once" helper — used by
+both `submit_and_wait()` (transfer submission) and the archive scripts'
+preflight `operation_ls()` calls (see [Archive flow](#archive-flow)
+above), so both get the same self-healing behavior instead of duplicating
+the recovery logic.
+
 ## Upload checksum verification (S3)
 
-Every `upload_file_to_s3()` call (`archive_to_s3.py:231`) verifies more than
+Every `upload_file_to_s3()` call (`archive_to_s3.py:256`) verifies more than
 just size when possible: it asks S3 to compute a whole-object CRC64NVME
 checksum (`ChecksumAlgorithm=CRC64NVME`, `ChecksumType=FULL_OBJECT`) during
 upload, reads it back via `head_object(ChecksumMode=ENABLED)`, and compares
@@ -370,7 +422,7 @@ practice; CRC64NVME is the only algorithm S3 lets you get a genuine
 whole-object checksum from for both single-part and multipart uploads.
 
 **Capability probe:** before doing any real work, `probe_checksum_support()`
-(`archive_to_s3.py:160`) uploads and verifies one tiny throwaway object,
+(`archive_to_s3.py:185`) uploads and verifies one tiny throwaway object,
 deliberately forced through the *multipart* code path
 (`TransferConfig(multipart_threshold=1, ...)`) even though the payload is
 tiny — testing the single-part path would give a false positive, since a

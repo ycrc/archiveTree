@@ -44,6 +44,7 @@ import argparse
 import os
 import sys
 import shutil
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import archive_config
@@ -97,6 +98,22 @@ def copy_file_to_local(src_path, dest_path, verbose=False, label="Copy",
 
     vprint(verbose, f"Verified copy of {local_size} bytes to {dest_path}.")
     return dest_size
+
+
+def probe_write_access(dest_dir, verbose=False):
+    """
+    Verify dest_dir is actually writable by creating and removing a tiny
+    throwaway file, rather than trusting os.access()'s permission-bit
+    check alone -- which can be misleading (e.g. running as root bypasses
+    it entirely) or miss real-world failure modes a plain stat can't see,
+    like a read-only NFS export, a full filesystem/quota, or restrictive
+    ACLs. Raises OSError on failure.
+    """
+    probe_path = os.path.join(dest_dir, f".archiveTree-probe-{uuid.uuid4().hex}")
+    vprint(verbose, f"Probing {probe_path} for write access...")
+    with open(probe_path, "wb") as f:
+        f.write(b"archiveTree write probe")
+    os.remove(probe_path)
 
 
 # ---------- Main ----------
@@ -234,9 +251,11 @@ def run(args):
                 file=sys.stderr,
             )
             sys.exit(1)
-        if not os.access(dest_dir, os.W_OK):
+        try:
+            probe_write_access(dest_dir, verbose=verbose)
+        except OSError as e:
             print(
-                f"ERROR: destination directory {dest_dir!r} is not writable.",
+                f"ERROR: destination directory {dest_dir!r} is not writable: {e}",
                 file=sys.stderr,
             )
             sys.exit(1)

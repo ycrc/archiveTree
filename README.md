@@ -279,7 +279,11 @@ tracking, and how permissions are restored), see
 ## S3 backend
 
 Use this when your destination storage is an S3 bucket, including Glacier /
-Deep Archive storage classes.
+Deep Archive storage classes. `archive_to_s3.py` verifies the bucket is
+reachable and actually writable (a real upload/delete probe, not just a
+permissions check) before doing any inventorying or tar-building, so a bad
+`--profile`/bucket/permission fails immediately instead of after however
+long walking and hashing the whole tree took.
 
 ### `archive_to_s3.py`
 
@@ -387,7 +391,11 @@ credentials or SDKs are required — `archive_to_local.py` /
 `restore_from_local.py` only need the destination directory to already be
 mounted and writable; this tool never mounts anything itself. This also
 makes the local backend a convenient way to test archiveTree's core logic
-end-to-end without any credentials at all.
+end-to-end without any credentials at all. `archive_to_local.py` verifies
+`dest_dir` is actually writable (a real write probe, not just a
+permissions check) before doing any inventorying or tar-building, so an
+unmounted or read-only destination fails immediately instead of after
+however long walking and hashing the whole tree took.
 
 Fill in the `[local]` section of your config file (see
 [Configuration file](#configuration-file) above) to avoid passing `dest_dir`
@@ -474,6 +482,12 @@ python3 restore_from_local.py --restore-dir /path/to/restore \
 ## Globus backend
 
 Use this when your destination storage is reached via Globus.
+`archive_to_globus.py` verifies both the source collection (at
+`--source-mount`) and the destination collection are actually reachable —
+including logging in, if that hasn't happened yet — before doing any
+inventorying or tar-building, so a bad collection UUID, wrong
+`--source-mount`, or login/permission problem fails immediately instead of
+after however long walking and hashing the whole tree took.
 
 ### One-time setup
 

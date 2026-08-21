@@ -157,6 +157,31 @@ def get_s3_client(profile=None, endpoint_url=None):
     return session.client("s3")
 
 
+def probe_write_access(s3_client, bucket, object_path, verbose=False):
+    """
+    Verify PutObject permission on the target prefix by uploading a tiny
+    throwaway object, then try to delete it.
+
+    Unlike probe_checksum_support() (a feature probe that treats any
+    failure as "unsupported" and falls back gracefully), a failure to
+    upload here always means "can't write" -- it must propagate, not be
+    swallowed, so callers can fail fast before building any tars. Deleting
+    the probe object afterward is best-effort only: a delete failure
+    doesn't mean the archive itself can't write, just that this one
+    leftover object needs manual cleanup.
+    """
+    opath = object_path.strip("/")
+    key = f"{opath}/.archiveTree-probe-{uuid.uuid4().hex}" if opath else f".archiveTree-probe-{uuid.uuid4().hex}"
+
+    vprint(verbose, f"Probing s3://{bucket}/{key} for write access...")
+    s3_client.put_object(Bucket=bucket, Key=key, Body=b"archiveTree write probe")
+
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=key)
+    except Exception as e:
+        vprint(verbose, f"WARNING: could not delete write-probe object {key}: {e}")
+
+
 def probe_checksum_support(s3_client, bucket, object_path, verbose=False):
     """
     Determine whether the target S3 endpoint supports whole-object CRC64NVME
@@ -490,6 +515,17 @@ def run(args):
             print(
                 f"ERROR: cannot access bucket {bucket!r} (check --profile, "
                 f"--endpoint-url, AWS credentials, and bucket name/permissions): {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        try:
+            probe_write_access(s3_client, bucket, object_path, verbose=verbose)
+        except Exception as e:
+            print(
+                f"ERROR: cannot write to s3://{bucket}/{object_path} (check "
+                "--profile, --endpoint-url, AWS credentials, and write "
+                f"permissions on that bucket/prefix): {e}",
                 file=sys.stderr,
             )
             sys.exit(1)

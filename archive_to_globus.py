@@ -31,6 +31,8 @@ import sys
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import globus_sdk
+
 import globus_auth
 import globus_config
 import globus_transfer
@@ -226,6 +228,46 @@ def run(args):
         )
         globus_transfer.require_under_mount(root_dir, source_mount, "the archived directory", "--source-mount")
 
+        transfer_client = globus_auth.get_transfer_client(
+            client_id, cache_path=token_cache, verbose=verbose, login_domain=login_domain
+        )
+
+        # Verify both collections are actually reachable now -- login works,
+        # the collection permits it, and (for the source) --source-mount is
+        # a real, listable path on that collection -- before building the
+        # inventory or any tars, so a bad collection/mount/permission fails
+        # fast instead of after a long, wasted run.
+        vprint(verbose, "Checking access to source and destination collections...")
+        try:
+            _, transfer_client = globus_transfer.call_with_auth_retry(
+                lambda tc: tc.operation_ls(source_collection, path=source_mount),
+                transfer_client, client_id=client_id, token_cache=token_cache,
+                login_domain=login_domain, verbose=verbose,
+            )
+        except globus_sdk.TransferAPIError as e:
+            print(
+                f"ERROR: cannot access {source_collection}:{source_mount} "
+                "(check --source-collection/--source-mount, and that you're "
+                f"logged in with an identity this collection allows): {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        try:
+            _, transfer_client = globus_transfer.call_with_auth_retry(
+                lambda tc: tc.operation_ls(dest_collection, path="/"),
+                transfer_client, client_id=client_id, token_cache=token_cache,
+                login_domain=login_domain, verbose=verbose,
+            )
+        except globus_sdk.TransferAPIError as e:
+            print(
+                f"ERROR: cannot access destination collection {dest_collection} "
+                "(check --dest-collection, and that you're logged in with an "
+                f"identity this collection allows): {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     vprint(verbose, "Building inventory...")
     inventory, _ = build_inventory(root_dir, verbose=verbose, max_workers=args.max_workers)
 
@@ -338,10 +380,9 @@ def run(args):
     task_ids = []
 
     if jobs:
-        transfer_client = globus_auth.get_transfer_client(
-            client_id, cache_path=token_cache, verbose=verbose, login_domain=login_domain
-        )
-
+        # transfer_client was already obtained during the preflight
+        # collection-access checks above; reused here rather than fetched
+        # again.
         planned_batches = list(globus_transfer.batches_by_count_and_bytes(
             jobs, args.max_items_per_task, args.max_batch_bytes,
             item_bytes=lambda j: j.get("est_bytes"),
@@ -463,9 +504,9 @@ def run(args):
     inv_source_path = globus_transfer.local_path_to_collection_relative(invpath, source_mount, "/")
 
     vprint(verbose, f"Transferring inventory to {dest_collection}:{inv_dest_path} ...")
-    transfer_client = globus_auth.get_transfer_client(
-        client_id, cache_path=token_cache, verbose=verbose, login_domain=login_domain
-    )
+    # transfer_client was already obtained during the preflight
+    # collection-access checks (dry-run always returns before reaching this
+    # point, so it's guaranteed to be set here).
     inv_transfer_data = globus_transfer.new_transfer(
         transfer_client, source_collection, dest_collection,
         label=f"archive {base_name} {archive_id} inventory",
