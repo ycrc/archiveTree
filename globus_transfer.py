@@ -110,14 +110,20 @@ def new_transfer(transfer_client, source_collection, destination_collection, lab
 def submit_and_wait(transfer_client, transfer_data, client_id=None,
                      token_cache=globus_auth.DEFAULT_TOKEN_CACHE,
                      verbose=False, poll_interval=15,
-                     total_bytes=None, desc=None):
+                     total_bytes=None, desc=None, login_domain=None):
     """
     Submit a TransferData task and block until it completes.
 
     On a ConsentRequired error, re-runs the interactive login with the
-    additionally required scopes, builds a fresh TransferClient from the
-    updated token cache, and retries submission once with that client
-    (which is also used for the subsequent polling below).
+    additionally required scopes. On a session_required_single_domain error
+    (a collection restricting access to identities from a specific
+    institutional domain, e.g. a cached login that predates --login-domain
+    being set), re-runs the interactive login requesting a session for that
+    domain -- login_domain, if given, picks which required domain to
+    request when the server lists more than one; otherwise the first one
+    listed is used. Either way, this builds a fresh TransferClient from the
+    updated token cache and retries submission once with that client (which
+    is also used for the subsequent polling below).
 
     If verbose, tqdm is installed, and total_bytes is given, shows a
     tqdm progress bar driven by the task's cumulative bytes_transferred
@@ -129,22 +135,44 @@ def submit_and_wait(transfer_client, transfer_data, client_id=None,
     try:
         submit_result = transfer_client.submit_transfer(transfer_data)
     except globus_sdk.TransferAPIError as err:
-        if not err.info.consent_required:
+        required_domains = (
+            err.info.authorization_parameters.session_required_single_domain
+            if err.info.authorization_parameters else None
+        )
+        if err.info.consent_required:
+            if not client_id:
+                raise RuntimeError(
+                    "Globus requires additional consent for this transfer, but no "
+                    "client_id was provided to retry the login."
+                ) from err
+            print(
+                "Encountered a ConsentRequired error; you must login again to "
+                "grant additional consents.\n"
+            )
+            globus_auth.interactive_login(
+                client_id,
+                scopes=err.info.consent_required.required_scopes,
+                cache_path=token_cache,
+            )
+        elif required_domains:
+            if not client_id:
+                raise RuntimeError(
+                    "This collection requires a login session from one of "
+                    f"{required_domains}, but the cached login doesn't have one, "
+                    "and no client_id was provided to retry the login."
+                ) from err
+            domain = login_domain or required_domains[0]
+            print(
+                f"Encountered a domain-restricted login error: this collection "
+                f"requires a session from one of {required_domains}. Logging in "
+                f"again, requesting an identity from {domain!r} (pass "
+                "--login-domain to choose a different one if needed)...\n"
+            )
+            globus_auth.interactive_login(
+                client_id, cache_path=token_cache, login_domain=domain,
+            )
+        else:
             raise
-        if not client_id:
-            raise RuntimeError(
-                "Globus requires additional consent for this transfer, but no "
-                "client_id was provided to retry the login."
-            ) from err
-        print(
-            "Encountered a ConsentRequired error; you must login again to "
-            "grant additional consents.\n"
-        )
-        globus_auth.interactive_login(
-            client_id,
-            scopes=err.info.consent_required.required_scopes,
-            cache_path=token_cache,
-        )
         transfer_client = globus_auth.get_transfer_client(
             client_id, cache_path=token_cache, verbose=verbose
         )

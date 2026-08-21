@@ -382,6 +382,7 @@ def run(args):
                 transfer_client, transfer_data, client_id=client_id,
                 token_cache=token_cache, verbose=verbose, poll_interval=args.poll_interval,
                 total_bytes=batch_bytes, desc=f"Transfer batch{batch_num}",
+                login_domain=login_domain,
             )
             task_ids.append(task["task_id"])
 
@@ -474,6 +475,7 @@ def run(args):
     globus_transfer.submit_and_wait(
         transfer_client, inv_transfer_data, client_id=client_id,
         token_cache=token_cache, verbose=verbose, poll_interval=args.poll_interval,
+        login_domain=login_domain,
     )
 
     # Now (optionally) delete the original directory tree

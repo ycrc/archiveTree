@@ -426,6 +426,7 @@ def run(args):
                 transfer_client, transfer_data, client_id=client_id,
                 token_cache=token_cache, verbose=verbose, poll_interval=args.poll_interval,
                 total_bytes=batch_bytes, desc=f"Transfer batch{batch_num}",
+                login_domain=login_domain,
             )
 
             # Restore original permission bits for individually-transferred

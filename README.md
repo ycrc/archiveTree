@@ -669,3 +669,21 @@ transfer:
 **Consent errors mid-transfer:** the scripts automatically re-run the
 login flow requesting the additional scope and retry once; if it still
 fails, run `--globus-logout` and log in again from scratch.
+
+**`PermissionDenied` / `Login Failed` / `None of your authenticated
+identities are from domains allowed by resource policies`** when
+submitting a transfer:
+- The destination or source collection restricts access to identities from
+  a specific institutional domain (e.g. `yale.edu`) via a
+  `session_required_single_domain` session policy — set `--login-domain`
+  (or `login_domain` in the config file) so the interactive login actually
+  requests a session tied to that domain; see
+  [One-time setup](#one-time-setup) above. The scripts automatically retry
+  once on this error by re-running the login with the domain named in the
+  error response (or your `--login-domain` value, if you set one and the
+  collection accepts more than one domain) — if it still fails, the
+  identity you log in with genuinely isn't from an allowed domain.
+- This is different from a stale cache silently ignoring `--login-domain`:
+  that flag only takes effect on a *fresh* login, so if you're setting it
+  for the first time on an account that already has a cached token, run
+  `--globus-logout` first to force the next login to actually request it.
