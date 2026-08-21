@@ -37,13 +37,13 @@ possible** — losing it means the archived objects are just opaque blobs
 
 ### On disk
 
-- Written by `write_inventory_file()` (`archive_common.py:628`), named
+- Written by `write_inventory_file()` (`archive_common.py:636`), named
   `<dirname>.inventory.<archive_id>.json.gz` by all three archive scripts.
 - Gzip-compressed by default (`gzip_output=True`). A copy is also
   uploaded/transferred/copied to the backend itself, under `.../inventory/`
   in the same archive prefix — but that's a convenience/DR copy; the
   operative copy is the local one you pass to `restore_from_*.py`.
-- Read via `load_inventory_file()` (`archive_common.py:673`), which detects
+- Read via `load_inventory_file()` (`archive_common.py:681`), which detects
   gzip by magic bytes (`\x1f\x8b`), not by filename, so it transparently
   reads both new `.json.gz` files and the many pre-existing plain-text
   `.json` inventories written before compression was added.
@@ -57,7 +57,7 @@ possible** — losing it means the archived objects are just opaque blobs
   "created_at": "2026-08-17T12:00:00Z",
   "total_files": 189,
   "total_bytes": 119191588,
-  "format_version": 4,
+  "format_version": 1,
   "files": [ /* per-file records */ ],
   "directories": [ /* per-directory rollups */ ],
   "unreadable_files": [ /* files build_inventory() couldn't read */ ],
@@ -98,9 +98,11 @@ Checksums: for a regular file, `sha256` is the hash of its contents. For a
 symlink, `sha256` is the hash of the **link target string**, not any file
 content — this is what `verify_restored_files()` re-checks after restore.
 Broken symlinks are recorded successfully (the target string is hashed
-regardless of whether it resolves).
+regardless of whether it resolves). On restore, the symlink itself is
+recreated via tar extraction (`tarfile`'s own symlink handling) — nothing
+reads `symlink_target` directly to reconstruct it.
 
-`mode` (added in format_version 4) is `stat.S_IMODE(st.st_mode)` — the
+`mode` is `stat.S_IMODE(st.st_mode)` — the
 POSIX permission bits (e.g. `420` decimal == `0o644`), captured from the
 same `os.lstat()` call used for everything else in the record. `owner` is
 purely informational (a username string from `pwd.getpwuid`); nothing on
@@ -117,7 +119,7 @@ while hashing) are handled differently — see
 
 ### Per-directory rollup (`directories[]`)
 
-Added in format_version 3. One entry per directory in the tree, **including
+One entry per directory in the tree, **including
 empty ones** (collected from every `os.walk()` iteration, not inferred from
 file paths — `archive_common.py:158`):
 
@@ -132,9 +134,9 @@ not just its direct children. The root directory itself is the entry with
 show directory sizes without re-scanning the full `files` list on every
 navigation — it's a precomputed `du`, done once at archive time.
 
-`mode` (added in format_version 5, mirroring the per-file `mode` added in
-format_version 4) is `stat.S_IMODE(st.st_mode)` for the directory itself,
-captured via `os.lstat(dirpath)` alongside the same `os.walk()` pass
+`mode` (mirroring the per-file `mode` above) is `stat.S_IMODE(st.st_mode)`
+for the directory itself, captured via `os.lstat(dirpath)` alongside the
+same `os.walk()` pass
 (`archive_common.py:164`). It's `null` if that `lstat()` call itself failed
 (e.g. a race with something removing the directory mid-walk) — every reader
 must treat `mode` as optional, same as the per-file field. See
@@ -178,7 +180,7 @@ backend's inventory: `restore_from_globus.py` requires
 (`restore_from_local.py`, same style); `restore_from_s3.py` requires
 `archive.backend` to be absent or `"s3"` (`restore_from_s3.py:571`) — the
 "absent" case keeps inventories written before the `"backend"` key existed
-working. `archive_common.detect_backend()` (`archive_common.py:362`)
+working. `archive_common.detect_backend()` (`archive_common.py:383`)
 implements the equivalent 3-way logic — `backend if backend in ("globus",
 "local") else "s3"` — for callers (`browse_inventory.py`, `restore.py`)
 that need to *pick* a backend before dispatching, rather than just
@@ -187,42 +189,27 @@ validating one after the fact.
 ### `format_version`
 
 A single top-level int, checked by `check_inventory_version()`
-(`archive_common.py:610`) right after loading, before anything else touches
-the file:
+(`archive_common.py:618`) right after loading, before anything else touches
+the file. `CURRENT_INVENTORY_VERSION` is what new writes are stamped with;
+`SUPPORTED_INVENTORY_VERSIONS` is the allow-list readers accept — currently
+both are just `1`, with no prior schema to stay compatible with.
 
-- **1** — no `format_version` key at all (every inventory written before
-  this scheme existed; absence is treated as implicit version 1).
-- **2** — `format_version` key added, no schema change otherwise.
-- **3** — adds `directories[]`.
-- **4** — adds `mode` to each file record and top-level `unreadable_files[]`.
-- **5** — current. Adds `mode` to each *directory* record in `directories[]`
-  too (`null` if the directory couldn't be `lstat()`'d at archive time).
-
-`SUPPORTED_INVENTORY_VERSIONS` is the allow-list readers accept;
-`CURRENT_INVENTORY_VERSION` is what new writes are stamped with. To add a
-new version: bump `CURRENT_INVENTORY_VERSION`, add it to
-`SUPPORTED_INVENTORY_VERSIONS`, and — since old and new versions must keep
-working side by side (there is a lot of format-1/2/3 data already archived
-that will never be rewritten) — make the schema change additive wherever
-possible, and branch on `inventory.get("format_version", 1)` in the specific
-code that needs to know, rather than assuming the current shape. Every
-consumer of a possibly-missing new field should use `.get()` with a sane
-default/skip, exactly like `mode`/`unreadable_files` do for older inventories.
+To add a new version in the future: bump `CURRENT_INVENTORY_VERSION`, add
+it to `SUPPORTED_INVENTORY_VERSIONS`, and decide then whether the change
+needs to be additive/backward-compatible with already-archived inventories
+or whether older versions can simply be dropped from
+`SUPPORTED_INVENTORY_VERSIONS`.
 
 ### Unreadable files (`unreadable_files[]`)
 
-Added in format_version 4. `_checksum_one()` (`archive_common.py:81`)
-catches `OSError` (e.g. `PermissionError`) around the read/hash step of a
-regular file and returns a skip reason instead of letting the exception
-propagate. `build_inventory()` then does three things for each such file:
-prints an unconditional (not `--verbose`-gated) warning to stderr, appends
-`{"relative_path": ..., "reason": "unreadable: ..."}` to this list, and
-simply omits the file from `files[]`/the directory rollup — the archive run
-continues and completes normally with everything else. Before
-format_version 4, this crashed the whole archive with an unhandled
-traceback partway through the (otherwise complete) checksum pass, since
-nothing caught the exception all the way up through
-`ThreadPoolExecutor`/`Future.result()` to `archive_to_*.py`'s `main()`.
+`_checksum_one()` (`archive_common.py:81`) catches `OSError` (e.g.
+`PermissionError`) around the read/hash step of a regular file and returns
+a skip reason instead of letting the exception propagate. `build_inventory()`
+then does three things for each such file: prints an unconditional (not
+`--verbose`-gated) warning to stderr, appends `{"relative_path": ...,
+"reason": "unreadable: ..."}` to this list, and simply omits the file from
+`files[]`/the directory rollup — the archive run continues and completes
+normally with everything else.
 
 ### Permission handling
 
@@ -236,31 +223,27 @@ matters beyond just bytes transferred:
   `extract_tar()`'s plain `tar.extract()` call restores it by default.
   Ownership (uid/gid) is *not* restored this way in practice, since
   `tarfile.chown()` only attempts `os.chown()` when running as root.
-- **Large files** (their own S3/Globus/local object): as of format_version 4,
+- **Large files** (their own S3/Globus/local object):
   `download_file_from_s3()` (`restore_from_s3.py`), the post-transfer pass
   in `restore_from_globus.py:run()`, and `copy_file_from_local()`
   (`restore_from_local.py`) all explicitly `os.chmod()` the restored file
-  using the `mode` recorded in its inventory record. For an inventory
-  written before format_version 4 (no `mode` field), this is skipped — the
-  file just gets the copy/write call's default permissions, as it always
-  did (though for local, `shutil.copy2` already preserves the source file's
-  mode as a side effect regardless, unlike S3/Globus's fresh downloads).
-- **Directories**: as of format_version 5, `restore_directory_permissions()`
-  (`archive_common.py`, shared by both restore scripts) `os.chmod()`s every
-  directory that has a recorded `mode` *and* actually exists under
-  `restore_root` after the restore, using the mode from its `directories[]`
-  record. It runs once, after all file content has been written (both
-  storage paths), deepest-first (most path separators first) — restoring a
-  restrictive parent mode (e.g. one missing the execute/search bit) before
-  a still-to-be-touched child would make that child unreachable for its own
-  `chmod()` call, so children are always done first. For an inventory
-  written before format_version 5 (no `mode` on directory records, or a
-  `null` value from a failed `lstat()` at archive time), the corresponding
-  directory is simply skipped — it keeps whatever `os.makedirs()`'s default
-  mode produced, as it always did. A directory that doesn't exist after
-  restore (e.g. never (re)created by a `--only-path`/`--only-prefix` subset
-  restore, or one that was empty in the original tree — see below) is also
-  skipped, not created just to be chmod'd.
+  using the `mode` recorded in its inventory record (though for local,
+  `shutil.copy2` already preserves the source file's mode as a side effect
+  regardless, unlike S3/Globus's fresh downloads).
+- **Directories**: `restore_directory_permissions()` (`archive_common.py`,
+  shared by all three restore scripts) `os.chmod()`s every directory that
+  has a recorded `mode` *and* actually exists under `restore_root` after
+  the restore, using the mode from its `directories[]` record. It runs
+  once, after all file content has been written (both storage paths),
+  deepest-first (most path separators first) — restoring a restrictive
+  parent mode (e.g. one missing the execute/search bit) before a
+  still-to-be-touched child would make that child unreachable for its own
+  `chmod()` call, so children are always done first. A directory with a
+  `null` `mode` (its `lstat()` failed at archive time) or that doesn't
+  exist after restore (e.g. never (re)created by a
+  `--only-path`/`--only-prefix` subset restore, or one that was empty in
+  the original tree — see below) is simply skipped, not created just to be
+  chmod'd.
 - **Empty directories** (zero files anywhere in their subtree) are *not*
   recreated on restore regardless of this feature: nothing in the restore
   path ever calls `os.makedirs()` for a directory that has no file selected
@@ -408,7 +391,7 @@ again all share the same shape, diverging on transfer mechanics.
    requires `archive.backend == "local"` and `archive.local_dest_dir` — before
    any script touches the objects themselves.
 
-2. **`select_relpaths()`** (`archive_common.py:368`) resolves `--only-path`
+2. **`select_relpaths()`** (`archive_common.py:391`) resolves `--only-path`
    (exact match, repeatable) and `--only-prefix` (repeatable) against
    `files[]`. With neither flag, everything is selected. **Note:**
    `--only-prefix` matching is a plain `str.startswith()` — not
@@ -470,7 +453,7 @@ again all share the same shape, diverging on transfer mechanics.
    [Permission handling](#permission-handling) above.
 
 7. **Optional `--verify-checksums`**: `verify_restored_files()`
-   (`archive_common.py:398`) re-hashes every restored file (or symlink
+   (`archive_common.py:421`) re-hashes every restored file (or symlink
    target) and compares to the inventory's recorded `sha256`, raising on any
    `missing`/`checksum_mismatch`.
 

@@ -1,32 +1,98 @@
 # archiveTree
 
-Tools for archiving a directory tree to remote storage and restoring it
-later, with three interchangeable backends:
+Long-term archival of large directory trees, with a browsable inventory and
+selective restore.
 
-- **S3** (`archive_to_s3.py` / `restore_from_s3.py`), including Glacier /
-  Deep Archive support.
-- **Globus** (`archive_to_globus.py` / `restore_from_globus.py`), for
-  destinations only reachable via a Globus collection.
-- **Local** (`archive_to_local.py` / `restore_from_local.py`), for a
-  locally-mounted destination directory (e.g. NFS/Lustre) — no cloud
-  credentials or SDKs required.
+Deep storage tiers (S3 Glacier/Deep Archive, tape-backed Globus
+collections, a cold NFS/Lustre mount) are cheap, but they're built for
+storing whole objects, not for living, POSIX directory trees with millions
+of small files. Uploading each file individually is slow and expensive at
+scale, and once a tree is archived, most tools give you nothing better than
+"pull the whole thing back" if you later need just one subdirectory.
+archiveTree exists to close that gap: it packs a directory tree into
+size-grouped tar bundles for efficient transfer, verifies every file's
+checksum before it lets you delete the original, and records exactly what
+went where in a JSON **inventory** file — so restoring later, in whole or
+in part, doesn't depend on remembering anything.
 
-All three backends work the same way conceptually:
-
-1. `archive_to_*.py` walks a directory, computes a SHA256 checksum and
-   metadata for every file, packs small files into tar bundles (large files
-   are transferred individually), uploads/transfers everything, writes a
-   JSON **inventory** file describing what went where, and then (with
-   confirmation) deletes the original directory.
-2. `restore_from_*.py` reads that inventory file and downloads/transfers
-   the data back, optionally verifying checksums against the inventory.
-
-The inventory file is the single source of truth for a restore — keep it
-somewhere safe (it's also written back to the remote storage itself as a
-copy).
+That inventory is the other half of the point. It's a self-contained map
+of the archived tree (paths, sizes, checksums, owners, permissions, and
+which archive object holds each file) that `browse-inventory` turns into
+an `ncdu`/`xdu`-style browser, months or years later, to find and restore
+exactly the files you need without touching the rest. The same archive/restore
+workflow works identically against S3, a Globus collection, or a plain
+locally-mounted directory, so the backend is a config choice, not a
+rewrite.
 
 For how this works internally (inventory format, archive/restore flow,
 backend differences), see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+---
+
+## Getting started
+
+This is the fast path: create a config file, archive a directory, browse
+the result, and restore from it. Details on every option follow further
+down.
+
+**1. Create a config file.** Copy the combined example (it has a section
+for every backend — S3, Globus, local — fill in only the one you're using)
+and edit it:
+
+```bash
+cp archive.cfg.example ~/.archive_globus.cfg
+$EDITOR ~/.archive_globus.cfg
+```
+
+See [`archive.cfg.example`](archive.cfg.example) for every setting,
+inline-documented, and the [Configuration file](#configuration-file)
+section below for precedence rules. (The filename `~/.archive_globus.cfg`
+is a legacy holdover from when Globus was the only backend — it's shared by
+all three now.)
+
+**2. Archive a directory**, using the `archive` wrapper. The backend comes
+from `--backend`, or from `backend = ...` in the `[archive]` section of the
+config file:
+
+```bash
+archive --backend local /path/to/mydata /mnt/archive_storage
+```
+
+This walks `/path/to/mydata`, hashes and tars up its files, copies/uploads
+everything to the destination, and writes an inventory file next to the
+source directory: `mydata.inventory.<archive_id>.json.gz`. Keep that file —
+it's the only thing a restore needs. (With `--delete`, the source directory
+is removed afterward, once every checksum has verified.)
+
+**3. Browse the inventory and pick what to restore**, using
+`browse-inventory`:
+
+```bash
+browse-inventory mydata.inventory.<archive_id>.json.gz
+```
+
+Navigate like a file manager, press `space` to mark files or whole
+directories, then `w` to write a ready-to-run restore script for exactly
+what's marked. See [The browser: `browse-inventory`](#the-browser-browse-inventory)
+for the full keybinding reference.
+
+**4. Restore.** Either submit the script `browse-inventory` wrote for you:
+
+```sbatch 
+./restore_<archive_id>.sh
+```
+
+or call `restore` directly for a full restore of everything in the
+inventory:
+
+```bash
+restore mydata.inventory.<archive_id>.json.gz 
+```
+
+`restore` auto-detects the backend from the inventory file itself, so
+`--backend`/config aren't needed here unless you want to override it.
+
+---
 
 ## Requirements
 
@@ -34,6 +100,9 @@ backend differences), see [ARCHITECTURE.md](ARCHITECTURE.md).
 - `boto3` (for the S3 tools)
 - `globus-sdk` (for the Globus tools)
 - `tqdm` (optional; enables progress bars with `--verbose`)
+- `awscrt` (optional; lets `archive_to_s3.py` verify uploads with S3's
+  whole-object CRC64NVME checksum instead of falling back to size-only
+  verification — see `--no-checksum-verify` below)
 
 The local backend (`archive_to_local.py` / `restore_from_local.py`) needs
 none of the above beyond the Python standard library — it never imports
@@ -41,82 +110,193 @@ none of the above beyond the Python standard library — it never imports
 convenient way to exercise most of this tool's logic without cloud
 credentials at all).
 
-Both S3 and Globus dependencies are available in the `archiver` conda
-environment on this system.
+---
+
+## Unified entrypoints: `archive`, `restore`, `browse-inventory`
+
+These three commands (installed as console scripts by `pyproject.toml`; run
+`python3 archive.py` / `restore.py` / `browse_inventory.py` directly if not
+installed) are the recommended way to use archiveTree day to day. `archive`
+and `restore` are thin dispatchers: they pick a backend, then hand every
+other flag straight to that backend's own script (`archive_to_s3.py`,
+`restore_from_globus.py`, etc.) untouched — so every flag documented later
+in this README under [S3](#s3-backend), [Local](#local-backend), and
+[Globus](#globus-backend) works exactly the same way through these wrappers.
+Reach for the backend-specific scripts directly only when you don't want
+the dispatch step, e.g. scripting against one backend exclusively.
+
+### `archive`
+
+```
+archive [--backend {s3,globus,local}] [--config-file PATH] <backend-specific args...>
+```
+
+| Argument | Description |
+|---|---|
+| `--backend {s3,globus,local}` | Which backend to use. Optional if `backend` is set in the `[archive]` section of the config file. |
+| `--config-file` | Config file path (default `~/.archive_globus.cfg`). Also passed through to the backend script. |
+| *(everything else)* | Forwarded as-is to the chosen backend's `archive_to_s3.py` / `archive_to_globus.py` / `archive_to_local.py` argument parser — see those sections below. |
+
+If no backend is specified (neither `--backend` nor the config file) and
+`-h`/`--help` isn't passed either, it exits with an error telling you how to
+pick one. With `-h`/`--help` and no backend yet resolved, it prints a short
+usage note instead (pass `--backend` first to see that backend's full flag
+list).
+
+Example:
+
+```bash
+archive --backend s3 --profile myprofile --verbose \
+    --storage-class DEEP_ARCHIVE /path/to/mydata mybucket archive-prefix
+```
+
+### `restore`
+
+```
+restore [--backend {s3,globus,local}] [--config-file PATH] inventory_file <backend-specific args...>
+```
+
+| Argument | Description |
+|---|---|
+| `--backend {s3,globus,local}` | Which backend to use. Optional — see auto-detection below. |
+| `--config-file` | Config file path (default `~/.archive_globus.cfg`). Also passed through to the backend script. |
+| *(everything else)* | Forwarded as-is to the chosen backend's `restore_from_s3.py` / `restore_from_globus.py` / `restore_from_local.py` argument parser — see those sections below. |
+
+Backend resolution order: `--backend` flag, then `backend` in the
+`[archive]` section of the config file, then **auto-detection** from the
+inventory file itself (its `archive.backend` field) — the common case, since
+almost every `restore` invocation already names an inventory file. If none
+of those resolve a backend, it prints an error (or, with `-h`/`--help`, a
+short usage note).
+
+Example:
+
+```bash
+restore --restore-dir /path/to/restore --verify-checksums --verbose \
+    mydata.inventory.<uuid>.json.gz
+```
+
+### The browser: `browse-inventory`
+
+```
+browse-inventory inventory_file
+```
+
+An interactive, full-screen (curses-based) browser for an inventory file —
+think `ncdu`/`xdu`: navigate the archived tree, see per-directory file
+counts and sizes without re-scanning anything, mark the files and/or
+directories you want back, and write a ready-to-run restore script for
+exactly that selection.
+
+The root listing has a synthetic `[ALL]` entry at the top — marking it
+selects the entire tree in one keystroke, equivalent to marking every
+top-level entry. Marking a directory selects its whole subtree; you don't
+need to also mark anything inside it (descendants of a marked directory are
+shown with `+` instead of `*`, meaning "covered, not directly marked").
+
+| Key | Action |
+|---|---|
+| `up`/`k`, `down`/`j` | Move the selection cursor. |
+| `right`/`Enter` | Enter the highlighted directory. |
+| `left`/`backspace` | Go up to the parent directory. |
+| `space` | Toggle mark on the highlighted file/directory. |
+| `s` | Cycle sort mode: name, size (desc/asc), file count (desc/asc). |
+| `v` | Toggle whether the generated restore script passes `--verbose`. |
+| `c` | Clear all marks. |
+| `w` | Write a restore script for the currently marked items. |
+| `d` | Debug view: list the archive objects (tars/individual files, with sizes) needed to satisfy the current selection, plus a preview of the restore command it would produce. |
+| `x`/`Esc` | Exit (offers to write a restore script first if anything is marked). |
+
+The header line shows a live summary as you mark things: how many files and
+bytes will be *restored* (`Restore:`), versus how many distinct archive
+objects and bytes must actually be *downloaded/transferred* to satisfy that
+(`Archive read:`) — usually far fewer, since one tar object can supply many
+restored files at once. The `d` debug view breaks that down object-by-object.
+
+Pressing `w` (or answering `y` to the exit prompt) walks you through:
+
+1. Restore to the **original** location recorded in the inventory, or a
+   **new** one you type in.
+2. Where to write the generated script (defaults to
+   `restore_<inventory_id>.sh` in the current directory).
+
+The script it writes is a `#!/usr/bin/env bash` file (with an `#SBATCH -c
+4` header for convenience on Slurm clusters) that calls the right
+`restore_from_*.py` for the inventory's backend, with `--only-prefix`/
+`--only-path` flags for every marked directory/file (or no filters at all,
+for a whole-tree selection), `--restore-dir` if you picked a new location,
+`--verbose` if toggled on, and `--max-workers "$SLURM_CPUS_PER_TASK"`. It's
+written executable (`chmod 755`) and ready to run or submit with `sbatch`
+as-is.  
+
+---
+
+## Configuration file
+
+All three backends share one config file location and format: a single INI
+file, default `~/.archive_globus.cfg`, overridable everywhere with
+`--config-file PATH` (Globus additionally honors `$GLOBUS_ARCHIVE_CONFIG`).
+One section per backend — `[s3]`, `[globus]`, `[local]` — plus `[archive]`
+for the unified entrypoints' default backend choice. A single value can
+also live in more than one config file's worth of sections at once; sections
+you're not using are simply ignored.
+
+**[`archive.cfg.example`](archive.cfg.example)** has every section, with
+every key inline-documented — copy it and fill in what you need:
+
+```bash
+cp archive.cfg.example ~/.archive_globus.cfg
+```
+
+Precedence for every value, highest first:
+
+- **S3 / Local:** CLI flag > config file. (No per-field environment
+  variables for these two backends.)
+- **Globus:** CLI flag > environment variable > config file. Environment
+  variable names are listed in `archive.cfg.example` next to each `[globus]`
+  key (e.g. `GLOBUS_ARCHIVE_CLIENT_ID`).
+
+If a required value is missing everywhere, every script exits with a clear
+error naming exactly which value is missing and how to supply it (which
+flag, env var, and config key).
+
+---
 
 ## Inventory file format
 
-Every inventory JSON has this shape:
-
-```jsonc
-{
-  "inventory_id": "<uuid>",       // == archive.archive_id
-  "root_dir": "/original/absolute/path",
-  "created_at": "2026-08-11T12:00:00Z",
-  "total_files": 18,
-  "total_bytes": 21002296,
-  "files": [
-    {
-      "relative_path": "file1",
-      "absolute_path": "/original/absolute/path/file1",
-      "size_bytes": 1234,
-      "ctime": "...",
-      "owner": "netid",
-      "sha256": "...",
-      "is_symlink": false,
-      "object_id": "tar-000000",     // which archived object holds this file
-      "object_type": "tar",          // "file" or "tar"
-      "object_key": "..."            // S3 key, Globus collection-relative path, or local filesystem path
-    },
-    ...
-  ],
-  "archive": {
-    // S3 backend:
-    "s3_bucket": "...",
-    // Globus backend:
-    "backend": "globus",
-    "globus_dest_collection": "<uuid>",
-    "globus_dest_path": "...",
-    "transfer_task_ids": ["<uuid>", ...],
-    // Local backend:
-    "backend": "local",
-    "local_dest_dir": "/path/to/mount",
-
-    "archive_id": "<uuid>",
-    "objects": [
-      {"id": "tar-000000", "type": "tar", "file_count": 18, ...},
-      {"id": "file-000000", "type": "file", "relative_path": "...", ...}
-    ]
-  }
-}
-```
-
-Symlinks are recorded specially: `is_symlink: true`, and `sha256` is the
-hash of the link target string (not file contents) — the symlink itself is
-recreated on restore via tar extraction, not by reading `symlink_target`
-directly.
+Every archive produces exactly one inventory JSON file next to the source
+directory — the sole record of what went where, and the only thing a
+restore needs. For the full schema (per-file and per-directory records,
+the backend-specific `archive` section, `format_version`, unreadable-file
+tracking, and how permissions are restored), see
+[ARCHITECTURE.md](ARCHITECTURE.md#the-inventory-file).
 
 ---
 
 ## S3 backend
 
+Use this when your destination storage is an S3 bucket, including Glacier /
+Deep Archive storage classes.
+
 ### `archive_to_s3.py`
 
 ```
-archive_to_s3.py [options] directory bucket object_path
+archive_to_s3.py [options] directory [bucket] [object_path]
 ```
 
 | Argument | Description |
 |---|---|
 | `directory` | Directory tree to archive. |
-| `bucket` | S3 bucket name. |
-| `object_path` | Base S3 prefix under which archive objects are stored. |
+| `bucket` | S3 bucket name. Optional if `bucket` is set in the `[s3]` section of the config file. |
+| `object_path` | Base S3 prefix under which archive objects are stored. Optional if `object_path` is set in the `[s3]` section of the config file. |
 | `--storage-class` | S3 storage class (`STANDARD`, `STANDARD_IA`, `ONEZONE_IA`, `INTELLIGENT_TIERING`, `GLACIER`, `GLACIER_IR`, `DEEP_ARCHIVE`). Default `STANDARD`. |
 | `--scratch-dir` | Where local tars are built (default: system temp). |
 | `--compression {none,gz}` | Tar compression. Default `none`. |
 | `--delete` | Delete the source directory tree after a successful archive. Default: keep it. |
 | `--profile` | AWS profile name. |
 | `--endpoint-url` | Custom S3-compatible endpoint. |
+| `--config-file` | Config file with an `[s3]` section supplying defaults for `bucket`/`object_path`/`profile`/`endpoint_url`/`storage_class` (default `~/.archive_globus.cfg`). |
+| `--no-checksum-verify` | Skip whole-object CRC64NVME checksum verification (and its startup capability probe); fall back to size-only verification. archiveTree auto-detects lack of support (missing `awscrt`, or an endpoint that doesn't support it) and falls back on its own — only needed if the probe itself is problematic for your endpoint. |
 | `--size-cutoff` | Files bigger than this (bytes) are uploaded individually. Default `1e9`. |
 | `--size-grouping` | Target tar-group size in bytes. Default `1e10`. |
 | `--max-workers` | Parallel hashing/upload workers. Default `4`. |
@@ -149,7 +329,9 @@ restore_from_s3.py [options] inventory_file
 | Argument | Description |
 |---|---|
 | `inventory_file` | Inventory JSON from `archive_to_s3.py`. |
-| `--profile` / `--endpoint-url` | Same as above. |
+| `--profile` | AWS profile name from `~/.aws/credentials` or `~/.aws/config`. |
+| `--endpoint-url` | Custom S3-compatible endpoint. |
+| `--config-file` | Config file with an `[s3]` section supplying defaults for `profile`/`endpoint_url` (default `~/.archive_globus.cfg`). |
 | `--scratch-dir` | Where downloaded tars land before extraction. |
 | `--restore-dir` | Restore target (default: the original `root_dir` recorded in the inventory). |
 | `--overwrite` | Allow restoring into a non-empty directory. |
@@ -164,6 +346,9 @@ restore_from_s3.py [options] inventory_file
 | `--restore-tier {Bulk,Standard,Expedited}` | Glacier restore speed. Default `Standard`. |
 | `--max-workers` | Parallel download/verify workers. Default `4`. |
 | `--verbose` | Progress messages / progress bars. |
+
+Directory permissions recorded in the inventory are restored automatically
+after file content is written; there's no separate flag for this.
 
 Example:
 
@@ -201,26 +386,19 @@ mounted and writable; this tool never mounts anything itself. This also
 makes the local backend a convenient way to test archiveTree's core logic
 end-to-end without any credentials at all.
 
-To avoid passing `dest_dir` on every invocation, copy the example config
-and fill in your mount path:
-
-```bash
-cp archive_local.cfg.example ~/.archive_globus.cfg
-```
+Fill in the `[local]` section of your config file (see
+[Configuration file](#configuration-file) above) to avoid passing `dest_dir`
+on every invocation:
 
 ```ini
 [local]
 dest_dir = /path/to/mount
 ```
 
-(The config filename is shared across all backends — see
-`archive_local.cfg.example` for details, including how to add this section
-to an existing S3/Globus config file instead of using a separate one.)
-
 ### `archive_to_local.py`
 
 ```
-archive_to_local.py [options] directory dest_dir
+archive_to_local.py [options] directory [dest_dir]
 ```
 
 | Argument | Description |
@@ -292,8 +470,7 @@ python3 restore_from_local.py --restore-dir /path/to/restore \
 
 ## Globus backend
 
-Use this when your destination storage is only reachable via a Globus
-collection rather than S3.
+Use this when your destination storage is reached via Globus.
 
 ### One-time setup
 
@@ -320,10 +497,11 @@ collection rather than S3.
    the GridFTP server — see Troubleshooting below.
 
 3. **Fill in a config file** so you don't have to pass all of this on
-   every command line. Copy the example and edit it:
+   every command line. Copy the combined example and edit the `[globus]`
+   section (see [Configuration file](#configuration-file) above):
 
    ```bash
-   cp archive_globus.cfg.example ~/.archive_globus.cfg
+   cp archive.cfg.example ~/.archive_globus.cfg
    ```
 
    ```ini
@@ -339,8 +517,9 @@ collection rather than S3.
    Every value can also be set via an environment variable
    (`GLOBUS_ARCHIVE_CLIENT_ID`, `GLOBUS_ARCHIVE_SOURCE_COLLECTION`,
    `GLOBUS_ARCHIVE_SOURCE_MOUNT`, `GLOBUS_ARCHIVE_DEST_COLLECTION`,
-   `GLOBUS_ARCHIVE_DEST_PATH`, `GLOBUS_ARCHIVE_TOKEN_CACHE`) or a CLI flag,
-   in that precedence order: **CLI flag > env var > config file**.
+   `GLOBUS_ARCHIVE_DEST_PATH`, `GLOBUS_ARCHIVE_TOKEN_CACHE`,
+   `GLOBUS_ARCHIVE_LOGIN_DOMAIN`) or a CLI flag, in that precedence order:
+   **CLI flag > env var > config file**.
 
 4. **First login.** The first time you run either script (outside
    `--dry-run`), it prints a URL — open it, log in, and paste the code
@@ -358,16 +537,16 @@ archive_to_globus.py [options] directory
 Same size-cutoff/tar-grouping behavior as `archive_to_s3.py`, but:
 
 - Transfers happen as one Globus Transfer task per run (or a few, batched
-  via `--max-items-per-task` for very large archives), not one call per
-  file — Globus tasks are async and server-managed. Progress is reported
-  at the task level (`--verbose`, polled every `--poll-interval` seconds),
-  not per-file.
+  via `--max-items-per-task`/`--max-batch-bytes` for very large archives),
+  not one call per file — Globus tasks are async and server-managed.
+  Progress is reported at the task level (`--verbose`, polled every
+  `--poll-interval` seconds), not per-file.
 - `--scratch-dir` (where tars are built) and the inventory output
   directory must both be reachable via the source collection, i.e. under
   `--source-mount` — the script checks this up front and errors clearly
   if not.
-- Local tars are deleted only after the *whole* transfer task succeeds
-  (not incrementally per-tar, since there's one task).
+- Local tars are deleted only after the whole batch's transfer task
+  succeeds (not incrementally per-tar).
 - There's no `--storage-class` (Globus collections don't have storage
   classes) and no `--profile`/`--endpoint-url` (S3-only concepts).
 
@@ -380,6 +559,7 @@ Same size-cutoff/tar-grouping behavior as `archive_to_s3.py`, but:
 | `--source-mount` | Local path corresponding to `--source-collection`'s root. |
 | `--client-id` | Globus Native App client ID. |
 | `--token-cache` | Cached-token file path. |
+| `--login-domain` | Require the interactive login to use an identity from this domain (e.g. `yale.edu`), via `session_required_single_domain`. Only takes effect on a fresh login — run `--globus-logout` first if a token cache already exists. |
 | `--config-file` | Config file path (default `~/.archive_globus.cfg`). |
 | `--globus-logout` | Revoke and delete cached tokens, then exit. |
 | `--scratch-dir` | Local tar-build directory (must be under `--source-mount`). |
@@ -394,6 +574,7 @@ Same size-cutoff/tar-grouping behavior as `archive_to_s3.py`, but:
 | `--no-verify-checksum-transfer` | Disable Globus's built-in transfer checksum verification (on by default; additive to the SHA256 already recorded in the inventory). |
 | `--poll-interval` | Seconds between task-status polls when `--verbose`. Default `15`. |
 | `--max-items-per-task` | Split into sequential batched tasks above this many objects. Default `10000`. |
+| `--max-batch-bytes` | Split into sequential batched tasks if the built tars for one batch (individually-transferred large files don't count) would exceed this many bytes; bounds peak local scratch-disk usage to roughly one batch's worth of tars. Default `1e11` (100GB). |
 | `--verbose` | Progress messages. |
 
 Example:
@@ -420,8 +601,8 @@ storage, so there's no `--auto-request-restore`/`--restore-days`/
 | `--archive-collection` | Override for the collection holding archived objects (default: read from the inventory itself). |
 | `--dest-collection` | Collection mapped to this machine's filesystem (the restore target). |
 | `--dest-mount` | Local path corresponding to `--dest-collection`'s root. |
-| `--client-id` / `--token-cache` / `--config-file` / `--globus-logout` | Same as the archive script. |
-| `--scratch-dir` | Where downloaded tars land before extraction (must be under `--dest-mount`). |
+| `--client-id` / `--token-cache` / `--login-domain` / `--config-file` / `--globus-logout` | Same as the archive script. |
+| `--scratch-dir` | Where downloaded tars land before extraction (must be under `--dest-mount`; default: a subdirectory of `--restore-dir`). |
 | `--restore-dir` | Restore target (default: the original `root_dir` from the inventory). |
 | `--overwrite` | Allow restoring into a non-empty directory. |
 | `--only-path` / `--only-prefix` | Restore a subset, same as the S3 script. |
@@ -432,7 +613,11 @@ storage, so there's no `--auto-request-restore`/`--restore-days`/
 | `--max-workers` | Parallel *local extraction/verify* workers. Default `4`. |
 | `--poll-interval` | Seconds between task-status polls when `--verbose`. Default `15`. |
 | `--max-items-per-task` | Split into sequential batched tasks above this many objects. Default `10000`. |
-| `--verbose` | Progress messages. |
+| `--max-batch-bytes` | Split into sequential batched download tasks if the tar objects for one batch (individually-transferred files don't count) would exceed this many bytes. Default `1e11` (100GB). |
+| `--verbose` | Progress messages / progress bars. |
+
+Directory permissions recorded in the inventory are restored automatically
+after file content is written; there's no separate flag for this.
 
 Example:
 

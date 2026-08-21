@@ -151,6 +151,7 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
 
     file_list = []
     dir_relpaths = []
+    dir_modes = {}
     scan_pbar = None
     if verbose and tqdm:
         scan_pbar = tqdm(desc="Scanning", unit="files")
@@ -159,6 +160,11 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
         if relpath == ".":
             relpath = ""
         dir_relpaths.append(relpath)
+        try:
+            dir_modes[relpath] = stat.S_IMODE(os.lstat(dirpath).st_mode)
+        except OSError as e:
+            vprint(verbose, f"WARNING: failed to stat directory {dirpath}: {e}")
+            dir_modes[relpath] = None
         if scan_pbar is not None:
             scan_pbar.set_postfix_str(dirpath, refresh=False)
         for name in filenames:
@@ -209,11 +215,16 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
     # Roll up file_count/total_bytes for every directory (including empty
     # ones), recursively covering everything in its subtree. "" denotes the
     # root directory itself.
-    dir_stats = {relpath: {"file_count": 0, "total_bytes": 0} for relpath in dir_relpaths}
+    dir_stats = {
+        relpath: {"file_count": 0, "total_bytes": 0, "mode": dir_modes.get(relpath)}
+        for relpath in dir_relpaths
+    }
     for rec in file_records:
         parent = os.path.dirname(rec["relative_path"])
         while True:
-            stats = dir_stats.setdefault(parent, {"file_count": 0, "total_bytes": 0})
+            stats = dir_stats.setdefault(
+                parent, {"file_count": 0, "total_bytes": 0, "mode": dir_modes.get(parent)}
+            )
             stats["file_count"] += 1
             stats["total_bytes"] += rec["size_bytes"]
             if parent == "":
@@ -225,6 +236,7 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
             "relative_path": relpath,
             "file_count": stats["file_count"],
             "total_bytes": stats["total_bytes"],
+            "mode": stats["mode"],
         }
         for relpath, stats in sorted(dir_stats.items())
     ]
@@ -526,9 +538,7 @@ def verify_restored_files(inventory, restore_root,
 
 def restore_directory_permissions(inventory, restore_root, verbose=False):
     """
-    Best-effort restore of each directory's recorded POSIX permission bits
-    (format_version 5+; a no-op per-directory for older inventories, since
-    "mode" is simply absent from their records).
+    Best-effort restore of each directory's recorded POSIX permission bits.
 
     Only directories that actually exist under restore_root are touched --
     for a partial restore (--only-path/--only-prefix), most directories in
@@ -599,19 +609,10 @@ def write_summary_csv(inventory, restore_root, subset_relpaths, verify_status,
 # top-level "format_version" key. Bump this (and add the new value to
 # SUPPORTED_INVENTORY_VERSIONS) any time the top-level inventory JSON
 # schema changes in a way readers need to know about.
-#   1 - no "format_version" key present (implicit/legacy).
-#   2 - "format_version" key added.
-#   3 - added top-level "directories": per-directory recursive rollup of
-#       file_count/total_bytes (see build_inventory()).
-#   4 - added "mode" (POSIX permission bits, stat.S_IMODE) to each file
-#       record, and a top-level "unreadable_files" list (relative_path +
-#       reason) for files build_inventory() couldn't read and had to skip.
-CURRENT_INVENTORY_VERSION = 4
+CURRENT_INVENTORY_VERSION = 1
 
-# Versions this codebase's readers know how to handle. Inventory files
-# written before this versioning scheme existed have no "format_version"
-# key at all; check_inventory_version() treats that as version 1.
-SUPPORTED_INVENTORY_VERSIONS = (1, 2, 3, 4)
+# Versions this codebase's readers accept.
+SUPPORTED_INVENTORY_VERSIONS = (1,)
 
 
 def check_inventory_version(inventory):

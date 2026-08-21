@@ -8,8 +8,18 @@ version = "0.1.0"
 [tasks]
 archive = "python archive.py"
 restore = "python restore.py"
+browse = "python browse_inventory.py"
 
 [dependencies]
+# Pinned to exclude conda-forge's free-threaded ("nogil"/cp3XXt) build:
+# without this, the solver can pick a freethreading build, and every run
+# then prints a RuntimeWarning ("The global interpreter lock (GIL) has been
+# enabled to load module '_brotli' ...") because _brotli (pulled in
+# transitively via boto3/botocore) hasn't declared nogil safety. Nothing in
+# this codebase benefits from free-threading (it uses ThreadPoolExecutor for
+# I/O-bound work, which is fine under the GIL), so there's no reason to use
+# that build.
+python = "3.12.*"
 boto3 = ">=1.43.73,<2"
 globus-sdk = ">=4.9.0,<5"
 tqdm = ">=4.70.0,<5"

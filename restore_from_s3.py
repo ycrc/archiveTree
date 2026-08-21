@@ -43,6 +43,7 @@ from archive_common import (
     select_relpaths,
     extract_tar,
     verify_restored_files,
+    restore_directory_permissions,
     write_summary_csv,
     check_inventory_version,
     load_inventory_file,
@@ -761,6 +762,11 @@ def run(args):
             tpath = fut.result()
             if tpath:
                 temp_tars.append(tpath)
+
+    # Restore directory permissions now that all file content has been
+    # written (deepest-first, so a restrictive parent mode never blocks
+    # writes still to come inside it).
+    restore_directory_permissions(inventory, restore_root, verbose=verbose)
 
     # Optional checksum verification
     verify_status = {}

@@ -3,10 +3,9 @@
 Interactively browse an inventory file (ncdu/xdu-view-style) and generate a
 restore script for a selected set of files and/or directory trees.
 
-Requires an inventory with format_version >= 3, since it relies on the
-per-directory rollup ("directories": file_count/total_bytes per directory,
-see build_inventory() in archive_common.py) to show directory sizes without
-re-scanning the full file list on every navigation.
+Relies on the per-directory rollup ("directories": file_count/total_bytes
+per directory, see build_inventory() in archive_common.py) to show
+directory sizes without re-scanning the full file list on every navigation.
 
 Navigation:
   up/k, down/j        move selection
@@ -61,7 +60,7 @@ def build_tree(inventory):
     """Build an in-memory directory tree from inventory["directories"] + inventory["files"]."""
     directories = inventory.get("directories")
     if directories is None:
-        raise ValueError("Inventory has no 'directories' rollup data (format_version < 3).")
+        raise ValueError("Inventory has no 'directories' rollup data.")
 
     nodes = {}
     for d in directories:
@@ -653,7 +652,7 @@ def main():
         description="Interactively browse an inventory file and generate a restore "
                     "script for a selected set of files/directories."
     )
-    parser.add_argument("inventory_file", help="Path to an inventory JSON file (format_version >= 3).")
+    parser.add_argument("inventory_file", help="Path to an inventory JSON file.")
     args = parser.parse_args()
 
     inv_path = os.path.abspath(args.inventory_file)
@@ -670,8 +669,7 @@ def main():
 
     if "directories" not in inventory:
         print(
-            "ERROR: This inventory has no 'directories' rollup data (format_version < 3). "
-            "Re-archive with a newer version of archiveTree to browse it.",
+            "ERROR: This inventory has no 'directories' rollup data.",
             file=sys.stderr,
         )
         sys.exit(1)
