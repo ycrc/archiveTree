@@ -40,6 +40,7 @@ from botocore.exceptions import ClientError
 import archive_config
 from archive_common import (
     vprint,
+    print_config,
     select_relpaths,
     extract_tar,
     verify_restored_files,
@@ -599,6 +600,28 @@ def run(args):
             print("ERROR: Inventory missing 'root_dir' and --restore-dir not provided.", file=sys.stderr)
             sys.exit(1)
         restore_root = os.path.abspath(original_root)
+
+    print_config(verbose, "Configuration", {
+        "inventory_file": inv_path,
+        "backend": "s3",
+        "bucket": bucket,
+        "profile": profile,
+        "endpoint_url": endpoint_url,
+        "config_file": config_path,
+        "restore_dir": restore_root,
+        "scratch_dir": args.scratch_dir,
+        "overwrite": args.overwrite,
+        "only_path": args.only_path,
+        "only_prefix": args.only_prefix,
+        "verify_checksums": args.verify_checksums,
+        "summary_csv": args.summary_csv,
+        "keep_tar": args.keep_tar,
+        "dry_run": args.dry_run,
+        "auto_request_restore": args.auto_request_restore,
+        "restore_days": args.restore_days,
+        "restore_tier": args.restore_tier,
+        "max_workers": args.max_workers,
+    })
 
     # Determine subset of relpaths to restore
     selected_relpaths = select_relpaths(

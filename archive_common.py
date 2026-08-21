@@ -43,6 +43,22 @@ def vprint(verbose, *args, **kwargs):
         print(*args, **kwargs)
 
 
+def print_config(verbose, label, settings):
+    """
+    Print a labeled, sorted "key = value" listing of the effective
+    configuration for this run, when --verbose. Meant to make it obvious
+    exactly which value (from a CLI flag, an env var, or the config file)
+    actually ended up in effect, since several of those can come from any
+    of the three and silently diverge from what's on the command line.
+    """
+    if not verbose:
+        return
+    print(f"{label}:")
+    width = max((len(k) for k in settings), default=0)
+    for key in sorted(settings):
+        print(f"  {key:<{width}} = {settings[key]!r}")
+
+
 def compute_sha256(path, verbose=False, use_tqdm=True):
     """Compute SHA256 checksum of a file with optional progress bar."""
     filesize = os.path.getsize(path)

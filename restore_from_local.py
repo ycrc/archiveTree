@@ -34,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import archive_config
 from archive_common import (
     vprint,
+    print_config,
     select_relpaths,
     extract_tar,
     verify_restored_files,
@@ -209,6 +210,22 @@ def run(args):
             print("ERROR: Inventory missing 'root_dir' and --restore-dir not provided.", file=sys.stderr)
             sys.exit(1)
         restore_root = os.path.abspath(original_root)
+
+    print_config(verbose, "Configuration", {
+        "inventory_file": inv_path,
+        "backend": "local",
+        "local_dest_dir": local_dest_dir,
+        "config_file": args.config_file,
+        "restore_dir": restore_root,
+        "scratch_dir": args.scratch_dir,
+        "overwrite": args.overwrite,
+        "only_path": args.only_path,
+        "only_prefix": args.only_prefix,
+        "verify_checksums": args.verify_checksums,
+        "summary_csv": args.summary_csv,
+        "dry_run": args.dry_run,
+        "max_workers": args.max_workers,
+    })
 
     # Determine subset of relpaths to restore
     selected_relpaths = select_relpaths(

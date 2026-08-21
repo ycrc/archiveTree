@@ -36,6 +36,7 @@ import globus_transfer
 
 from archive_common import (
     vprint,
+    print_config,
     select_relpaths,
     extract_tar,
     verify_restored_files,
@@ -223,6 +224,17 @@ def run(args):
         "GLOBUS_ARCHIVE_ARCHIVE_COLLECTION", "archive_collection",
     )
 
+    # Resolved (but not required) unconditionally, including on --dry-run,
+    # purely so --verbose's configuration listing below always reflects
+    # what's actually configured; required below only once we're past the
+    # dry-run early exit and actually about to transfer.
+    dest_collection = globus_config.resolve(
+        args.dest_collection, "GLOBUS_ARCHIVE_SOURCE_COLLECTION", config, "source_collection"
+    )
+    dest_mount = globus_config.resolve(
+        args.dest_mount, "GLOBUS_ARCHIVE_SOURCE_MOUNT", config, "source_mount"
+    )
+
     # Map object_id -> metadata
     objects_by_id = {obj["id"]: obj for obj in objects}
 
@@ -235,6 +247,31 @@ def run(args):
             print("ERROR: Inventory missing 'root_dir' and --restore-dir not provided.", file=sys.stderr)
             sys.exit(1)
         restore_root = os.path.abspath(original_root)
+
+    print_config(verbose, "Configuration", {
+        "inventory_file": inv_path,
+        "backend": "globus",
+        "client_id": client_id,
+        "token_cache": token_cache,
+        "login_domain": login_domain,
+        "archive_collection": archive_collection,
+        "dest_collection": dest_collection,
+        "dest_mount": dest_mount,
+        "config_file": config_file,
+        "restore_dir": restore_root,
+        "scratch_dir": args.scratch_dir,
+        "overwrite": args.overwrite,
+        "only_path": args.only_path,
+        "only_prefix": args.only_prefix,
+        "verify_checksums": args.verify_checksums,
+        "summary_csv": args.summary_csv,
+        "keep_tar": args.keep_tar,
+        "dry_run": args.dry_run,
+        "max_workers": args.max_workers,
+        "poll_interval": args.poll_interval,
+        "max_items_per_task": args.max_items_per_task,
+        "max_batch_bytes": args.max_batch_bytes,
+    })
 
     # Determine subset of relpaths to restore
     selected_relpaths = select_relpaths(
@@ -308,19 +345,15 @@ def run(args):
 
     vprint(verbose, f"Restoring into directory: {restore_root}")
 
-    # Require full Globus config now that we're actually transferring.
+    # Require full Globus config now that we're actually transferring
+    # (dest_collection/dest_mount were already resolved above, for the
+    # --verbose configuration listing).
     client_id = globus_config.require(
         client_id, "Globus client ID", "--client-id", "GLOBUS_ARCHIVE_CLIENT_ID", "client_id"
-    )
-    dest_collection = globus_config.resolve(
-        args.dest_collection, "GLOBUS_ARCHIVE_SOURCE_COLLECTION", config, "source_collection"
     )
     dest_collection = globus_config.require(
         dest_collection, "destination collection", "--dest-collection",
         "GLOBUS_ARCHIVE_SOURCE_COLLECTION", "source_collection",
-    )
-    dest_mount = globus_config.resolve(
-        args.dest_mount, "GLOBUS_ARCHIVE_SOURCE_MOUNT", config, "source_mount"
     )
     dest_mount = globus_config.require(
         dest_mount, "destination mount", "--dest-mount",

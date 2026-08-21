@@ -39,6 +39,7 @@ import globus_transfer
 
 from archive_common import (
     vprint,
+    print_config,
     build_inventory,
     create_tar,
     partition_by_size,
@@ -198,6 +199,46 @@ def run(args):
         dest_path, "destination path", "--dest-path", "GLOBUS_ARCHIVE_DEST_PATH", "dest_path"
     )
 
+    # Resolved (but not yet required) unconditionally, including on
+    # --dry-run, purely so --verbose's configuration listing below always
+    # reflects what's actually configured; validated below only when
+    # they're actually needed (i.e. not a dry run).
+    source_collection = globus_config.resolve(
+        args.source_collection, "GLOBUS_ARCHIVE_SOURCE_COLLECTION", config, "source_collection"
+    )
+    source_mount = globus_config.resolve(
+        args.source_mount, "GLOBUS_ARCHIVE_SOURCE_MOUNT", config, "source_mount"
+    )
+    dest_collection = globus_config.resolve(
+        args.dest_collection, "GLOBUS_ARCHIVE_DEST_COLLECTION", config, "dest_collection"
+    )
+
+    print_config(verbose, "Configuration", {
+        "directory": root_dir,
+        "backend": "globus",
+        "client_id": client_id,
+        "token_cache": token_cache,
+        "login_domain": login_domain,
+        "source_collection": source_collection,
+        "source_mount": source_mount,
+        "dest_collection": dest_collection,
+        "dest_path": dest_path,
+        "config_file": config_file,
+        "scratch_dir": args.scratch_dir,
+        "compression": args.compression,
+        "delete": args.delete,
+        "size_cutoff": args.size_cutoff,
+        "size_grouping": args.size_grouping,
+        "max_workers": args.max_workers,
+        "dry_run": args.dry_run,
+        "inventory_dir": inv_dir,
+        "summary": args.summary,
+        "no_verify_checksum_transfer": args.no_verify_checksum_transfer,
+        "poll_interval": args.poll_interval,
+        "max_items_per_task": args.max_items_per_task,
+        "max_batch_bytes": args.max_batch_bytes,
+    })
+
     # Unless this is a dry run, we'll eventually transfer, so require the
     # full Globus config now -- before building the inventory or any tars --
     # so a missing value fails fast instead of after a long run.
@@ -205,22 +246,13 @@ def run(args):
         client_id = globus_config.require(
             client_id, "Globus client ID", "--client-id", "GLOBUS_ARCHIVE_CLIENT_ID", "client_id"
         )
-        source_collection = globus_config.resolve(
-            args.source_collection, "GLOBUS_ARCHIVE_SOURCE_COLLECTION", config, "source_collection"
-        )
         source_collection = globus_config.require(
             source_collection, "source collection", "--source-collection",
             "GLOBUS_ARCHIVE_SOURCE_COLLECTION", "source_collection",
         )
-        source_mount = globus_config.resolve(
-            args.source_mount, "GLOBUS_ARCHIVE_SOURCE_MOUNT", config, "source_mount"
-        )
         source_mount = globus_config.require(
             source_mount, "source mount", "--source-mount",
             "GLOBUS_ARCHIVE_SOURCE_MOUNT", "source_mount",
-        )
-        dest_collection = globus_config.resolve(
-            args.dest_collection, "GLOBUS_ARCHIVE_DEST_COLLECTION", config, "dest_collection"
         )
         dest_collection = globus_config.require(
             dest_collection, "destination collection", "--dest-collection",

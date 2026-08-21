@@ -64,6 +64,7 @@ from botocore.exceptions import ClientError
 import archive_config
 from archive_common import (
     vprint,
+    print_config,
     build_inventory,
     create_tar,
     partition_by_size,
@@ -503,6 +504,27 @@ def run(args):
             file=sys.stderr,
         )
         sys.exit(1)
+
+    print_config(verbose, "Configuration", {
+        "directory": root_dir,
+        "backend": "s3",
+        "bucket": bucket,
+        "object_path": object_path,
+        "profile": profile,
+        "endpoint_url": endpoint_url,
+        "storage_class": storage_class,
+        "config_file": config_path,
+        "no_checksum_verify": args.no_checksum_verify,
+        "scratch_dir": args.scratch_dir,
+        "compression": args.compression,
+        "delete": args.delete,
+        "size_cutoff": args.size_cutoff,
+        "size_grouping": args.size_grouping,
+        "max_workers": args.max_workers,
+        "dry_run": args.dry_run,
+        "inventory_dir": inv_dir,
+        "summary": args.summary,
+    })
 
     # Verify credentials and bucket access now, before building the inventory
     # or any tars, so a bad --profile/--endpoint-url/bucket fails fast instead

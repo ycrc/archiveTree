@@ -50,6 +50,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import archive_config
 from archive_common import (
     vprint,
+    print_config,
     compute_sha256,
     build_inventory,
     create_tar,
@@ -238,6 +239,23 @@ def run(args):
         sys.exit(1)
 
     dest_dir = os.path.abspath(dest_dir)
+
+    print_config(verbose, "Configuration", {
+        "directory": root_dir,
+        "backend": "local",
+        "dest_dir": dest_dir,
+        "config_file": config_path,
+        "scratch_dir": args.scratch_dir,
+        "compression": args.compression,
+        "delete": args.delete,
+        "verify_checksum": args.verify_checksum,
+        "size_cutoff": args.size_cutoff,
+        "size_grouping": args.size_grouping,
+        "max_workers": args.max_workers,
+        "dry_run": args.dry_run,
+        "inventory_dir": inv_dir,
+        "summary": args.summary,
+    })
 
     # Verify the destination is reachable and writable now, before building
     # the inventory or any tars, so a bad/unmounted dest_dir fails fast

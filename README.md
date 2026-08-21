@@ -109,6 +109,15 @@ none of the above beyond the Python standard library — it never imports
 convenient way to exercise most of this tool's logic without cloud
 credentials at all).
 
+**`--verbose` on every `archive_to_*.py`/`restore_from_*.py` script (and
+`archive`/`restore`, which forward it through)** prints a `Configuration:`
+listing right at startup, before any real work begins: every setting that
+went into this run, after resolving CLI flag / environment variable /
+config file precedence — the actual bucket, `dest_dir`, Globus collection,
+etc. in effect, not just what was passed on the command line. Useful for
+confirming which value a setting actually resolved to, since several of
+them can come from any of those three sources.
+
 ---
 
 ## Unified entrypoints: `archive`, `restore`, `browse-inventory`

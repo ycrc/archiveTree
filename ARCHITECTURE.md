@@ -269,6 +269,30 @@ matters beyond just bytes transferred:
   restored by anything in this codebase, for either storage path or either
   files/directories.
 
+## `--verbose` configuration listing
+
+`archive_common.print_config(verbose, label, settings)` prints a sorted
+`key = value` listing under a `label:` header when `verbose` is true, and
+is a no-op otherwise. Every `archive_to_*.py`/`restore_from_*.py` script
+calls it once near the top of `run()`, after resolving every setting that
+comes from more than one source (CLI flag / env var / config file), so the
+listing always shows the value actually in effect, not just what was
+passed on the command line. It's called *after* config resolution but
+*before* anything that requires those values to be valid — printed even
+on `--dry-run`, and even when a value is still `None` because it hasn't
+been validated yet (`archive_config.require()`/`globus_config.require()`
+run separately, after this).
+
+For the two Globus scripts specifically, this required splitting
+`globus_config.resolve()` (informational, no validation, safe to call
+unconditionally) from `globus_config.require()` (the actual "fail if
+missing" check): `source_collection`/`source_mount`/`dest_collection`
+(`archive_to_globus.py`) and `dest_collection`/`dest_mount`
+(`restore_from_globus.py`) are `resolve()`d unconditionally so the listing
+reflects them even on a `--dry-run` (or, for restore, even before the
+dry-run early exit), but are only `require()`d later, at the point they're
+actually needed.
+
 ## Archive flow
 
 `archive_to_s3.py`, `archive_to_globus.py`, and `archive_to_local.py` all
