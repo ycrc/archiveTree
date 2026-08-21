@@ -133,7 +133,7 @@ archive [--backend {s3,globus,local}] [--config-file PATH] <backend-specific arg
 | Argument | Description |
 |---|---|
 | `--backend {s3,globus,local}` | Which backend to use. Optional if `backend` is set in the `[archive]` section of the config file. |
-| `--config-file` | Config file path (default `~/.archive_globus.cfg`). Also passed through to the backend script. |
+| `--config-file` | Config file path (default `~/.archive.cfg`). Also passed through to the backend script. |
 | *(everything else)* | Forwarded as-is to the chosen backend's `archive_to_s3.py` / `archive_to_globus.py` / `archive_to_local.py` argument parser — see those sections below. |
 
 If no backend is specified (neither `--backend` nor the config file) and
@@ -158,7 +158,7 @@ restore [--backend {s3,globus,local}] [--config-file PATH] inventory_file <backe
 | Argument | Description |
 |---|---|
 | `--backend {s3,globus,local}` | Which backend to use. Optional — see auto-detection below. |
-| `--config-file` | Config file path (default `~/.archive_globus.cfg`). Also passed through to the backend script. |
+| `--config-file` | Config file path (default `~/.archive.cfg`). Also passed through to the backend script. |
 | *(everything else)* | Forwarded as-is to the chosen backend's `restore_from_s3.py` / `restore_from_globus.py` / `restore_from_local.py` argument parser — see those sections below. |
 
 Backend resolution order: `--backend` flag, then `backend` in the
@@ -233,7 +233,7 @@ as-is.
 ## Configuration file
 
 All three backends share one config file location and format: a single INI
-file, default `~/.archive_globus.cfg`, overridable everywhere with
+file, default `~/.archive.cfg`, overridable everywhere with
 `--config-file PATH` (Globus additionally honors `$GLOBUS_ARCHIVE_CONFIG`).
 One section per backend — `[s3]`, `[globus]`, `[local]` — plus `[archive]`
 for the unified entrypoints' default backend choice. A single value can
@@ -244,7 +244,7 @@ you're not using are simply ignored.
 every key inline-documented — copy it and fill in what you need:
 
 ```bash
-cp archive.cfg.example ~/.archive_globus.cfg
+cp archive.cfg.example ~/.archive.cfg
 ```
 
 Precedence for every value, highest first:
@@ -294,7 +294,7 @@ archive_to_s3.py [options] directory [bucket] [object_path]
 | `--delete` | Delete the source directory tree after a successful archive. Default: keep it. |
 | `--profile` | AWS profile name. |
 | `--endpoint-url` | Custom S3-compatible endpoint. |
-| `--config-file` | Config file with an `[s3]` section supplying defaults for `bucket`/`object_path`/`profile`/`endpoint_url`/`storage_class` (default `~/.archive_globus.cfg`). |
+| `--config-file` | Config file with an `[s3]` section supplying defaults for `bucket`/`object_path`/`profile`/`endpoint_url`/`storage_class` (default `~/.archive.cfg`). |
 | `--no-checksum-verify` | Skip whole-object CRC64NVME checksum verification (and its startup capability probe); fall back to size-only verification. archiveTree auto-detects lack of support (missing `awscrt`, or an endpoint that doesn't support it) and falls back on its own — only needed if the probe itself is problematic for your endpoint. |
 | `--size-cutoff` | Files bigger than this (bytes) are uploaded individually. Default `1e9`. |
 | `--size-grouping` | Target tar-group size in bytes. Default `1e10`. |
@@ -330,7 +330,7 @@ restore_from_s3.py [options] inventory_file
 | `inventory_file` | Inventory JSON from `archive_to_s3.py`. |
 | `--profile` | AWS profile name from `~/.aws/credentials` or `~/.aws/config`. |
 | `--endpoint-url` | Custom S3-compatible endpoint. |
-| `--config-file` | Config file with an `[s3]` section supplying defaults for `profile`/`endpoint_url` (default `~/.archive_globus.cfg`). |
+| `--config-file` | Config file with an `[s3]` section supplying defaults for `profile`/`endpoint_url` (default `~/.archive.cfg`). |
 | `--scratch-dir` | Where downloaded tars land before extraction. |
 | `--restore-dir` | Restore target (default: the original `root_dir` recorded in the inventory). |
 | `--overwrite` | Allow restoring into a non-empty directory. |
@@ -407,7 +407,7 @@ archive_to_local.py [options] directory [dest_dir]
 | `--scratch-dir` | Where local tars are built (default: system temp). |
 | `--compression {none,gz}` | Tar compression. Default `none`. |
 | `--delete` | Delete the source directory tree after a successful archive. Default: keep it. |
-| `--config-file` | Config file path (default `~/.archive_globus.cfg`), read for the `[local]` section's `dest_dir`. |
+| `--config-file` | Config file path (default `~/.archive.cfg`), read for the `[local]` section's `dest_dir`. |
 | `--verify-checksum` | After each copy, recompute SHA256 of the destination and compare it to the source checksum. Off by default: size-only verification (a plain filesystem copy has no network-transit integrity gap the way S3 uploads do, so this is opt-in rather than automatic). |
 | `--size-cutoff` | Files bigger than this (bytes) are copied individually. Default `1e9`. |
 | `--size-grouping` | Target tar-group size in bytes. Default `1e10`. |
@@ -500,7 +500,7 @@ Use this when your destination storage is reached via Globus.
    section (see [Configuration file](#configuration-file) above):
 
    ```bash
-   cp archive.cfg.example ~/.archive_globus.cfg
+   cp archive.cfg.example ~/.archive.cfg
    ```
 
    ```ini
@@ -559,7 +559,7 @@ Same size-cutoff/tar-grouping behavior as `archive_to_s3.py`, but:
 | `--client-id` | Globus Native App client ID. |
 | `--token-cache` | Cached-token file path. |
 | `--login-domain` | Require the interactive login to use an identity from this domain (e.g. `yale.edu`), via `session_required_single_domain`. Only takes effect on a fresh login — run `--globus-logout` first if a token cache already exists. |
-| `--config-file` | Config file path (default `~/.archive_globus.cfg`). |
+| `--config-file` | Config file path (default `~/.archive.cfg`). |
 | `--globus-logout` | Revoke and delete cached tokens, then exit. |
 | `--scratch-dir` | Local tar-build directory (must be under `--source-mount`). |
 | `--compression {none,gz}` | Tar compression. Default `none`. |
@@ -580,7 +580,7 @@ Example:
 
 ```bash
 python3 archive_to_globus.py --verbose /path/to/mydata
-# (collection UUIDs / mount / client-id come from ~/.archive_globus.cfg)
+# (collection UUIDs / mount / client-id come from ~/.archive.cfg)
 ```
 
 ### `restore_from_globus.py`

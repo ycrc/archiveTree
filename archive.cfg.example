@@ -5,7 +5,7 @@
 # backend(s) you actually use -- the rest can stay untouched, or you can
 # delete them:
 #
-#   cp archive.cfg.example ~/.archive_globus.cfg
+#   cp archive.cfg.example ~/.archive.cfg
 #
 # The config filename/location is shared across all backends and both the
 # per-backend scripts (archive_to_s3.py, archive_to_globus.py, ...) and the

@@ -32,13 +32,22 @@ sanity_pip_check = True
 
 options = {'modulename': False}  # not a single importable package, see below
 
+# Ship the combined example config (all three backends' [s3]/[globus]/[local]
+# sections) alongside the module, so users have something to `cp` from
+# without needing a checkout of the source repo.
+postinstallcmds = [
+    'mkdir -p %(installdir)s/etc',
+    'cp %(start_dir)s/archive.cfg.example %(installdir)s/etc/',
+]
+
 sanity_check_paths = {
     'files': ['bin/archive-to-s3', 'bin/restore-from-s3',
               'bin/archive-to-globus', 'bin/restore-from-globus',
               'bin/archive-to-local', 'bin/restore-from-local',
               'bin/archive', 'bin/restore',
-              'bin/browse-inventory', 'bin/list-object-status'],
-    'dirs': ['lib/python%(pyshortver)s/site-packages'],
+              'bin/browse-inventory', 'bin/list-object-status',
+              'etc/archive.cfg.example'],
+    'dirs': ['lib/python%(pyshortver)s/site-packages', 'etc'],
 }
 
 sanity_check_commands = [

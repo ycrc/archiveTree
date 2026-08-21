@@ -521,7 +521,7 @@ know which unrecognized flags take a value, an invocation like
 two flags this module actually owns has no such ambiguity.
 
 **Config file**: the same physical file used by the Globus scripts today
-(default `~/.archive_globus.cfg`, overridable via `--config-file` /
+(default `~/.archive.cfg`, overridable via `--config-file` /
 `GLOBUS_ARCHIVE_CONFIG`), generalized to hold multiple named INI sections —
 `[archive]` (`backend = s3|globus|local`), `[s3]`
 (`bucket`/`object_path`/`profile`/`endpoint_url`/`storage_class` for
