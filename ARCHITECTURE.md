@@ -37,13 +37,13 @@ possible** — losing it means the archived objects are just opaque blobs
 
 ### On disk
 
-- Written by `write_inventory_file()` (`archive_common.py:636`), named
+- Written by `write_inventory_file()` (`archive_common.py:650`), named
   `<dirname>.inventory.<archive_id>.json.gz` by all three archive scripts.
 - Gzip-compressed by default (`gzip_output=True`). A copy is also
   uploaded/transferred/copied to the backend itself, under `.../inventory/`
   in the same archive prefix — but that's a convenience/DR copy; the
   operative copy is the local one you pass to `restore_from_*.py`.
-- Read via `load_inventory_file()` (`archive_common.py:681`), which detects
+- Read via `load_inventory_file()` (`archive_common.py:695`), which detects
   gzip by magic bytes (`\x1f\x8b`), not by filename, so it transparently
   reads both new `.json.gz` files and the many pre-existing plain-text
   `.json` inventories written before compression was added.
@@ -101,6 +101,17 @@ Broken symlinks are recorded successfully (the target string is hashed
 regardless of whether it resolves). On restore, the symlink itself is
 recreated via tar extraction (`tarfile`'s own symlink handling) — nothing
 reads `symlink_target` directly to reconstruct it.
+
+A symlink whose target is a directory is archived as a leaf entry, the
+same as a symlink to a file — its target's contents are never walked into.
+This needs explicit handling in `build_inventory()`
+(`archive_common.py:158`): `os.walk()`'s `is_dir()` check follows symlinks,
+so such a path is classified as a subdirectory and shows up in `dirnames`,
+not `filenames`, even though `os.walk()` still (correctly, per
+`followlinks=False`) never descends into it. Anything found in `dirnames`
+that `os.path.islink()` is true for is added to the file-hashing work list
+exactly like a `filenames` entry, rather than being left to fall through
+unrecorded.
 
 `mode` is `stat.S_IMODE(st.st_mode)` — the
 POSIX permission bits (e.g. `420` decimal == `0o644`), captured from the
@@ -180,7 +191,7 @@ backend's inventory: `restore_from_globus.py` requires
 (`restore_from_local.py`, same style); `restore_from_s3.py` requires
 `archive.backend` to be absent or `"s3"` (`restore_from_s3.py:571`) — the
 "absent" case keeps inventories written before the `"backend"` key existed
-working. `archive_common.detect_backend()` (`archive_common.py:383`)
+working. `archive_common.detect_backend()` (`archive_common.py:397`)
 implements the equivalent 3-way logic — `backend if backend in ("globus",
 "local") else "s3"` — for callers (`browse_inventory.py`, `restore.py`)
 that need to *pick* a backend before dispatching, rather than just
@@ -189,7 +200,7 @@ validating one after the fact.
 ### `format_version`
 
 A single top-level int, checked by `check_inventory_version()`
-(`archive_common.py:618`) right after loading, before anything else touches
+(`archive_common.py:632`) right after loading, before anything else touches
 the file. `CURRENT_INVENTORY_VERSION` is what new writes are stamped with;
 `SUPPORTED_INVENTORY_VERSIONS` is the allow-list readers accept — currently
 both are just `1`, with no prior schema to stay compatible with.
@@ -271,7 +282,7 @@ follow the same sequence; only the upload/transfer mechanics differ.
 3. **`group_small_files(small_files, size_grouping)`** greedily bins the
    small files into groups of ~`--size-grouping` bytes each (default 10 GB) —
    simple running-total bin packing, not size-balanced, just threshold-based
-   (`archive_common.py:265`).
+   (`archive_common.py:279`).
 
 4. A flat **job list** is built: one `"file"` job per large file, one
    `"tar"` job per small-file group, with sequential `object_id`s.
@@ -391,7 +402,7 @@ again all share the same shape, diverging on transfer mechanics.
    requires `archive.backend == "local"` and `archive.local_dest_dir` — before
    any script touches the objects themselves.
 
-2. **`select_relpaths()`** (`archive_common.py:391`) resolves `--only-path`
+2. **`select_relpaths()`** (`archive_common.py:405`) resolves `--only-path`
    (exact match, repeatable) and `--only-prefix` (repeatable) against
    `files[]`. With neither flag, everything is selected. **Note:**
    `--only-prefix` matching is a plain `str.startswith()` — not
@@ -453,7 +464,7 @@ again all share the same shape, diverging on transfer mechanics.
    [Permission handling](#permission-handling) above.
 
 7. **Optional `--verify-checksums`**: `verify_restored_files()`
-   (`archive_common.py:421`) re-hashes every restored file (or symlink
+   (`archive_common.py:435`) re-hashes every restored file (or symlink
    target) and compares to the inventory's recorded `sha256`, raising on any
    `missing`/`checksum_mismatch`.
 

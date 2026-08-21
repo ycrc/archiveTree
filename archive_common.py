@@ -155,7 +155,7 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
     scan_pbar = None
     if verbose and tqdm:
         scan_pbar = tqdm(desc="Scanning", unit="files")
-    for dirpath, _, filenames in os.walk(root_dir):
+    for dirpath, dirnames, filenames in os.walk(root_dir):
         relpath = os.path.relpath(dirpath, root_dir)
         if relpath == ".":
             relpath = ""
@@ -171,6 +171,20 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
             file_list.append(os.path.join(dirpath, name))
             if scan_pbar is not None:
                 scan_pbar.update(1)
+        # os.walk() classifies a symlink pointing at a directory as a
+        # "directory" (its is_dir() follows the link) and puts it in
+        # dirnames, not filenames -- even though followlinks=False (the
+        # default here) means it's never descended into. Without this, such
+        # a symlink is silently dropped: not walked, and never picked up as
+        # a file either. Archive it the same way as a symlink-to-a-file: as
+        # a leaf entry via file_list/_checksum_one(), not its target's
+        # contents.
+        for name in dirnames:
+            full_path = os.path.join(dirpath, name)
+            if os.path.islink(full_path):
+                file_list.append(full_path)
+                if scan_pbar is not None:
+                    scan_pbar.update(1)
     if scan_pbar is not None:
         scan_pbar.close()
 
