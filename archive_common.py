@@ -550,18 +550,52 @@ def verify_restored_files(inventory, restore_root,
     return status_map
 
 
-def restore_directory_permissions(inventory, restore_root, verbose=False):
+def restore_directory_permissions(inventory, restore_root, only_prefixes=None, verbose=False):
     """
-    Best-effort restore of each directory's recorded POSIX permission bits.
+    Create any recorded directory that's empty (tar extraction only creates
+    the parent dirs its member files need, so nothing else ever creates an
+    originally-empty directory), then best-effort restore each directory's
+    recorded POSIX permission bits.
 
-    Only directories that actually exist under restore_root are touched --
-    for a partial restore (--only-path/--only-prefix), most directories in
-    the inventory were never (re)created and are correctly skipped. Applied
-    deepest-first, after all file content has been written, so setting a
-    restrictive mode (e.g. missing write/execute bits) on a parent never
-    blocks creating or chmod'ing something still to come inside it.
+    only_prefixes should be the same --only-prefix values (if any) the
+    restore itself was filtered by. With none given (a full restore), every
+    recorded directory is in scope; otherwise only directories at or under
+    one of those prefixes are created -- e.g. an empty directory outside a
+    `--only-prefix` subset restore is correctly left uncreated, same as any
+    file outside that subset. `--only-path` (individual files, not
+    directory trees) never brings an empty directory into scope on its own.
+
+    Permission restoration itself still only touches directories that
+    actually exist under restore_root by this point -- either just created
+    here, or already populated by file extraction. Applied deepest-first,
+    after all file content has been written, so setting a restrictive mode
+    (e.g. missing write/execute bits) on a parent never blocks creating or
+    chmod'ing something still to come inside it.
     """
     directories = inventory.get("directories", [])
+
+    def in_scope(relpath):
+        if not only_prefixes:
+            return True
+        stripped = relpath.rstrip("/")
+        for pref in only_prefixes:
+            pref_stripped = pref.rstrip("/")
+            if (relpath.startswith(pref) or stripped == pref_stripped
+                    or pref_stripped.startswith(stripped + "/")):
+                return True
+        return False
+
+    for rec in directories:
+        relpath = rec["relative_path"]
+        if not relpath or not in_scope(relpath):
+            continue
+        full_path = os.path.join(restore_root, relpath)
+        if os.path.isdir(full_path):
+            continue
+        try:
+            os.makedirs(full_path, exist_ok=True)
+        except OSError as e:
+            print(f"WARNING: failed to create directory {full_path}: {e}", file=sys.stderr)
 
     # Deepest first: more path separators means deeper. The empty string
     # (restore_root itself) sorts last, as depth 0.

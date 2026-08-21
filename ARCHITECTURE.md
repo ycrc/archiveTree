@@ -242,26 +242,29 @@ matters beyond just bytes transferred:
   `shutil.copy2` already preserves the source file's mode as a side effect
   regardless, unlike S3/Globus's fresh downloads).
 - **Directories**: `restore_directory_permissions()` (`archive_common.py`,
-  shared by all three restore scripts) `os.chmod()`s every directory that
-  has a recorded `mode` *and* actually exists under `restore_root` after
-  the restore, using the mode from its `directories[]` record. It runs
-  once, after all file content has been written (both storage paths),
-  deepest-first (most path separators first) — restoring a restrictive
-  parent mode (e.g. one missing the execute/search bit) before a
-  still-to-be-touched child would make that child unreachable for its own
-  `chmod()` call, so children are always done first. A directory with a
-  `null` `mode` (its `lstat()` failed at archive time) or that doesn't
-  exist after restore (e.g. never (re)created by a
-  `--only-path`/`--only-prefix` subset restore, or one that was empty in
-  the original tree — see below) is simply skipped, not created just to be
-  chmod'd.
-- **Empty directories** (zero files anywhere in their subtree) are *not*
-  recreated on restore regardless of this feature: nothing in the restore
-  path ever calls `os.makedirs()` for a directory that has no file selected
-  underneath it (tar extraction only creates the parent dirs its member
-  files need). Their `mode` is still captured and stored at archive time,
-  it just has nothing to apply to on restore — a pre-existing gap, not
-  something this feature changes.
+  shared by all three restore scripts) runs once, after all file content
+  has been written (both storage paths), in two passes over
+  `directories[]`:
+  1. **Create.** Tar extraction only creates the parent dirs its member
+     files need, so a directory that was empty in the original tree (zero
+     files anywhere in its subtree) never otherwise gets created. This
+     pass `os.makedirs()`s any recorded directory that doesn't already
+     exist under `restore_root` and is in scope of the restore: always, for
+     a full restore, or (for a `--only-path`/`--only-prefix` subset
+     restore) only a directory at or under one of the given
+     `--only-prefix` values — `--only-path` alone never brings an empty
+     directory into scope, since it names individual files, not trees. An
+     empty directory outside a `--only-prefix` subset is correctly left
+     uncreated, same as any file outside that subset.
+  2. **Chmod.** `os.chmod()`s every directory that has a recorded `mode`
+     *and* now exists under `restore_root` (either just created above, or
+     already populated by file extraction), using the mode from its
+     `directories[]` record, deepest-first (most path separators first) —
+     restoring a restrictive parent mode (e.g. one missing the
+     execute/search bit) before a still-to-be-touched child would make
+     that child unreachable for its own `chmod()` call, so children are
+     always done first. A directory with a `null` `mode` (its `lstat()`
+     failed at archive time) is simply skipped.
 - **Ownership** is recorded (the `owner` username string) but never
   restored by anything in this codebase, for either storage path or either
   files/directories.
@@ -459,8 +462,10 @@ again all share the same shape, diverging on transfer mechanics.
      local-to-local copy.
 
 6. **`restore_directory_permissions()`** (`archive_common.py`, unconditional,
-   no flag): `os.chmod()`s every directory with a recorded `mode` that
-   actually exists under `restore_root`, deepest-first. See
+   no flag): creates any recorded, in-scope directory that doesn't already
+   exist (e.g. one that was empty in the original tree), then `os.chmod()`s
+   every directory with a recorded `mode` that now exists under
+   `restore_root`, deepest-first. See
    [Permission handling](#permission-handling) above.
 
 7. **Optional `--verify-checksums`**: `verify_restored_files()`

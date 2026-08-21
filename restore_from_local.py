@@ -344,7 +344,7 @@ def run(args):
     # Restore directory permissions now that all file content has been
     # written (deepest-first, so a restrictive parent mode never blocks
     # writes still to come inside it).
-    restore_directory_permissions(inventory, restore_root, verbose=verbose)
+    restore_directory_permissions(inventory, restore_root, only_prefixes=args.only_prefix, verbose=verbose)
 
     # Optional checksum verification
     verify_status = {}
