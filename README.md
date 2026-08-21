@@ -161,12 +161,16 @@ restore [--backend {s3,globus,local}] [--config-file PATH] inventory_file <backe
 | `--config-file` | Config file path (default `~/.archive.cfg`). Also passed through to the backend script. |
 | *(everything else)* | Forwarded as-is to the chosen backend's `restore_from_s3.py` / `restore_from_globus.py` / `restore_from_local.py` argument parser — see those sections below. |
 
-Backend resolution order: `--backend` flag, then `backend` in the
-`[archive]` section of the config file, then **auto-detection** from the
-inventory file itself (its `archive.backend` field) — the common case, since
-almost every `restore` invocation already names an inventory file. If none
-of those resolve a backend, it prints an error (or, with `-h`/`--help`, a
-short usage note).
+Backend resolution order: `--backend` flag, then **auto-detection** from
+the inventory file itself (its `archive.backend` field) — the common case,
+since almost every `restore` invocation already names an inventory file —
+then, only if neither of those resolves one, `backend` in the `[archive]`
+section of the config file. Auto-detection outranks the config default on
+purpose: the inventory already unambiguously records which backend
+archived it, so a leftover `backend = ...` left over from some other
+archive run should never override that and silently send the restore into
+the wrong backend's script. If none of those resolve a backend, it prints
+an error (or, with `-h`/`--help`, a short usage note).
 
 Example:
 

@@ -512,16 +512,34 @@ a subprocess — so `archive.py --backend s3 ...` is behaviorally
 indistinguishable from calling `archive_to_s3.py ...` directly with the
 same flags.
 
-**Backend resolution** (`archive_config.resolve_backend()`): `--backend` on
-the command line, else the `backend` key in the config file's `[archive]`
-section, else — for `restore.py` only — auto-detected from the inventory
-file itself via `archive_common.detect_backend()`. The auto-detect path is
-best-effort: it assumes the first non-flag token in argv is the inventory
-path (`restore.py`'s `_guess_inventory_file()`); if that guess is wrong or
-the file isn't a readable inventory, detection just fails cleanly into the
-"could not determine backend" error rather than picking a wrong backend
-silently. `archive.py` has no such fallback, since there's no inventory
-file to inspect before archiving.
+**Backend resolution** (`archive_config.resolve_backend()`, called from
+`restore.py`'s `main()`): `--backend` on the command line, else — for
+`restore.py` only — auto-detected from the inventory file itself via
+`archive_common.detect_backend()`, else the `backend` key in the config
+file's `[archive]` section. Auto-detection deliberately outranks the
+config default: the inventory already unambiguously records which backend
+archived it, so a `backend = ...` left over from some other archive run
+(a very likely scenario, since the same config file is shared across all
+three backends) must never silently override that and send a restore into
+the wrong backend's script — this was a real bug prior to this ordering,
+where a stale config default beat the correct auto-detected backend with
+no warning.
+
+The auto-detect path is best-effort: `restore.py`'s
+`_guess_inventory_file()` scans argv for the first token that isn't a flag
+and isn't the value of a preceding one, using `_value_taking_flags()` (a
+union, derived from all three backends' actual `build_arg_parser()`
+output via their actions' `nargs`, of every flag that consumes a value —
+not just `--config-file`, so a flag like `--restore-dir X` ahead of the
+inventory path on the command line doesn't get mistaken for it) to know
+which tokens to skip. If the guess is still wrong, or the file isn't a
+readable inventory, detection just falls through to the config default (or
+the "could not determine backend" error if there isn't one either) — it
+never causes a *silent* wrong-backend dispatch, since each backend
+script's own guard (see [Backend differences](#backend-differences) above)
+still catches an inventory it didn't produce and names the correct script
+to use instead. `archive.py` has no such fallback, since there's no
+inventory file to inspect before archiving.
 
 **Why the dispatchers hand-parse `--backend`/`--config-file` instead of
 using `argparse.parse_known_args()`:** `extract_dispatch_flags()`

@@ -35,7 +35,12 @@ import shlex
 import sys
 from datetime import datetime
 
-from archive_common import check_inventory_version, detect_backend, load_inventory_file
+from archive_common import (
+    check_inventory_version,
+    detect_backend,
+    load_inventory_file,
+    restore_script_for_backend,
+)
 
 SORT_MODES = ["name", "size-desc", "size-asc", "count-desc", "count-asc"]
 
@@ -240,10 +245,7 @@ def restore_command_groups(inventory_path, inventory, dir_prefixes, file_paths,
     about what command a selection produces.
     """
     backend = detect_backend(inventory)
-    restore_script = {
-        "globus": "restore_from_globus.py",
-        "local": "restore_from_local.py",
-    }.get(backend, "restore_from_s3.py")
+    restore_script = restore_script_for_backend(backend)
     restore_script_path = os.path.join(script_dir, restore_script)
 
     cmd_groups = [

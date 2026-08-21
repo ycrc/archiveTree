@@ -402,6 +402,13 @@ def detect_backend(inventory):
     return backend if backend in ("globus", "local") else "s3"
 
 
+def restore_script_for_backend(backend):
+    """Return the restore_from_*.py script name for a detect_backend() value."""
+    return {"globus": "restore_from_globus.py", "local": "restore_from_local.py"}.get(
+        backend, "restore_from_s3.py"
+    )
+
+
 def select_relpaths(inventory, only_paths=None, only_prefixes=None, verbose=False):
     """
     Determine which relative paths from the inventory to restore,

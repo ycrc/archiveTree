@@ -43,6 +43,8 @@ from archive_common import (
     write_summary_csv,
     check_inventory_version,
     load_inventory_file,
+    detect_backend,
+    restore_script_for_backend,
 )
 
 
@@ -199,10 +201,11 @@ def run(args):
         sys.exit(1)
 
     if archive.get("backend") != "globus":
+        actual_backend = detect_backend(inventory)
         print(
             "ERROR: This inventory was not produced by archive_to_globus.py "
-            f"(archive.backend={archive.get('backend')!r}). Use restore_from_s3.py "
-            "for S3-backed inventories.",
+            f"(archive.backend={archive.get('backend')!r}). Use "
+            f"{restore_script_for_backend(actual_backend)} instead.",
             file=sys.stderr,
         )
         sys.exit(1)

@@ -47,6 +47,8 @@ from archive_common import (
     write_summary_csv,
     check_inventory_version,
     load_inventory_file,
+    detect_backend,
+    restore_script_for_backend,
 )
 
 # Optional tqdm for progress bars
@@ -569,10 +571,11 @@ def run(args):
         sys.exit(1)
 
     if archive.get("backend") not in (None, "s3"):
+        actual_backend = detect_backend(inventory)
         print(
             f"ERROR: This inventory was not produced by archive_to_s3.py "
-            f"(archive.backend={archive.get('backend')!r}). Use restore_from_globus.py "
-            "for Globus-backed inventories.",
+            f"(archive.backend={archive.get('backend')!r}). Use "
+            f"{restore_script_for_backend(actual_backend)} instead.",
             file=sys.stderr,
         )
         sys.exit(1)
