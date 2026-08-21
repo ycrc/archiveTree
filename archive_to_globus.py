@@ -480,6 +480,7 @@ def run(args):
     if not args.delete:
         print("Source directory left intact (pass --delete to remove it). "
               "Inventory is available locally and on the Globus collection.")
+        print(f"Inventory file: {invpath}")
         return
 
     vprint(verbose, f"Removing directory tree {root_dir}")
@@ -497,6 +498,7 @@ def run(args):
         print(f"  Objects created:  {num_objects}")
 
     vprint(verbose, "Done.")
+    print(f"Inventory file: {invpath}")
 
 
 def main():
