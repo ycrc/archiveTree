@@ -1,0 +1,116 @@
+# Example archiveTree config file: every section used by every backend, in
+# one place.
+#
+# Copy to the default location and fill in only the section(s) for the
+# backend(s) you actually use -- the rest can stay untouched, or you can
+# delete them:
+#
+#   cp archive.cfg.example ~/.archive_globus.cfg
+#
+# The config filename/location is shared across all backends and both the
+# per-backend scripts (archive_to_s3.py, archive_to_globus.py, ...) and the
+# unified `archive`/`restore` entrypoints. Override the location with
+# --config-file PATH or $GLOBUS_ARCHIVE_CONFIG on any command.
+#
+# Precedence for every value below, highest first: CLI flag > environment
+# variable (Globus values only) > this file. Nothing here is required --
+# every value can also be passed as a CLI flag every time instead.
+#
+# This file is plain INI, read with Python's configparser. "key = value  #
+# comment" works (inline comments are stripped); don't put a literal '#' in
+# a real value (UUIDs and filesystem paths never need one).
+
+
+# ---------------------------------------------------------------------------
+# [archive] -- picks the default backend for the unified `archive`/`restore`
+# entrypoints, so you don't have to pass --backend on every call. Only read
+# by archive.py/restore.py; the backend-specific scripts ignore it. `restore`
+# also auto-detects the backend from an inventory file's own
+# archive.backend field when this is unset, so it's most useful for
+# `archive`, where there's no inventory yet to detect it from.
+# ---------------------------------------------------------------------------
+[archive]
+backend = local
+# backend = s3
+# backend = globus
+
+
+# ---------------------------------------------------------------------------
+# [s3] -- used by archive_to_s3.py / restore_from_s3.py / list_object_status.py
+# (and by `archive`/`restore` when backend = s3 above).
+# No environment variables for this backend; CLI flag > this file.
+# ---------------------------------------------------------------------------
+[s3]
+# S3 bucket name and base prefix under which archive objects are stored.
+# Equivalent to archive_to_s3.py's positional `bucket`/`object_path` args --
+# set here so you don't have to repeat them every time.
+bucket = my-archive-bucket
+object_path = archive-prefix
+
+# AWS profile name from ~/.aws/credentials or ~/.aws/config. Optional; falls
+# back to the default credential chain if unset.
+profile = my-aws-profile
+
+# Custom S3-compatible endpoint URL. Optional; omit for real AWS S3.
+# endpoint_url = https://s3.example.edu
+
+# Default --storage-class for newly archived objects. Optional (defaults to
+# STANDARD if unset here and not passed on the CLI). One of STANDARD,
+# STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER, GLACIER_IR,
+# DEEP_ARCHIVE.
+storage_class = STANDARD
+
+
+# ---------------------------------------------------------------------------
+# [globus] -- used by archive_to_globus.py / restore_from_globus.py (and by
+# `archive`/`restore` when backend = globus above). See the "Globus backend"
+# section of README.md for how to obtain a client_id and collection UUIDs.
+# ---------------------------------------------------------------------------
+[globus]
+# Globus Native App client ID, registered at
+# https://app.globus.org/settings/developers. Do not reuse Globus's shared
+# public tutorial client ID for real archiving runs.
+# Env var: GLOBUS_ARCHIVE_CLIENT_ID
+client_id = <native-app-client-id>
+
+# Where to cache the Globus login refresh token after the first interactive
+# login. Env var: GLOBUS_ARCHIVE_TOKEN_CACHE
+token_cache = ~/.globus_archive_tokens.json
+
+# Optional: require the interactive login to use an identity from this
+# domain (e.g. yale.edu), via Globus's session_required_single_domain.
+# Needed for collections that restrict sessions to a specific institutional
+# domain. Only takes effect on a fresh login: run --globus-logout first if a
+# token cache already exists. Env var: GLOBUS_ARCHIVE_LOGIN_DOMAIN
+# login_domain = yale.edu
+
+# The Globus collection mapped to this machine's filesystem, and the local
+# path corresponding to that collection's root. Used as the "source" side
+# when archiving, and the "destination" side when restoring.
+# Env vars: GLOBUS_ARCHIVE_SOURCE_COLLECTION / GLOBUS_ARCHIVE_SOURCE_MOUNT
+source_collection = <uuid>
+source_mount = /gpfs/gibbs
+
+# The Globus collection where archives are stored, and a base path within it
+# under which archive objects are placed.
+# Env vars: GLOBUS_ARCHIVE_DEST_COLLECTION / GLOBUS_ARCHIVE_DEST_PATH
+dest_collection = <uuid>
+dest_path = archive
+
+# Optional: override for the collection holding already-archived objects,
+# used by restore_from_globus.py's --archive-collection. Normally this is
+# read from the inventory file itself and does not need to be set here.
+# Env var: GLOBUS_ARCHIVE_ARCHIVE_COLLECTION
+# archive_collection = <uuid>
+
+
+# ---------------------------------------------------------------------------
+# [local] -- used by archive_to_local.py / restore_from_local.py (and by
+# `archive`/`restore` when backend = local above).
+# No environment variables for this backend; CLI flag > this file.
+# ---------------------------------------------------------------------------
+[local]
+# Locally-mounted destination directory under which archive objects are
+# stored (e.g. an NFS or Lustre mount point). Must already be mounted and
+# writable -- this tool does not mount anything itself.
+dest_dir = /path/to/mount
