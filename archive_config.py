@@ -7,7 +7,7 @@ restore_from_globus.py) and the unified archive.py / restore.py dispatchers.
 Precedence for every value: CLI flag > env var (if any) > config file >
 hard error naming exactly which values are missing and how to supply them.
 
-The config file is a single INI file (default ~/.archive_globus.cfg,
+The config file is a single INI file (default ~/.archive.cfg,
 overridable via --config-file / GLOBUS_ARCHIVE_CONFIG) with one section per
 concern, e.g. [archive] for backend selection, [s3] for S3 settings,
 [globus] for Globus settings. globus_config.py is a thin backward-compatible
@@ -18,7 +18,7 @@ import configparser
 import os
 import sys
 
-DEFAULT_CONFIG_FILE = os.path.expanduser("~/.archive_globus.cfg")
+DEFAULT_CONFIG_FILE = os.path.expanduser("~/.archive.cfg")
 
 
 def load_config_file(path, section):

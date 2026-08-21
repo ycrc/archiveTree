@@ -40,14 +40,13 @@ for every backend — S3, Globus, local — fill in only the one you're using)
 and edit it:
 
 ```bash
-cp archive.cfg.example ~/.archive_globus.cfg
-$EDITOR ~/.archive_globus.cfg
+cp archive.cfg.example ~/.archive.cfg
+$EDITOR ~/.archive.cfg
 ```
 
 See [`archive.cfg.example`](archive.cfg.example) for every setting,
 inline-documented, and the [Configuration file](#configuration-file)
-section below for precedence rules. (The filename `~/.archive_globus.cfg`
-is a legacy holdover from when Globus was the only backend — it's shared by
+section below for precedence rules. 
 all three now.)
 
 **2. Archive a directory**, using the `archive` wrapper. The backend comes
