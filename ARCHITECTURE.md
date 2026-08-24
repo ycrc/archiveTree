@@ -224,38 +224,58 @@ normally with everything else.
 
 ### Permission handling
 
-Whether a file's permission bits survive a restore depends on which storage
-path it took, and is a good example of why the [tar-grouping cost](#why-restore-1-file-can-mean-download-100)
-matters beyond just bytes transferred:
+Every restored file's permission bits come from the `mode` its inventory
+record recorded at archive time, applied explicitly — never inherited from
+whatever the transport happened to produce:
 
-- **Small files** (bundled into a tar group): permission bits are restored
-  as an incidental side effect of Python's `tarfile` module — `create_tar()`
-  captures `st_mode` automatically when adding each file, and
-  `extract_tar()`'s plain `tar.extract()` call restores it by default.
-  Ownership (uid/gid) is *not* restored this way in practice, since
-  `tarfile.chown()` only attempts `os.chown()` when running as root.
-- **Large files** (their own S3/Globus/local object):
-  `download_file_from_s3()` (`restore_from_s3.py`), the post-transfer pass
-  in `restore_from_globus.py:run()`, and `copy_file_from_local()`
-  (`restore_from_local.py`) all explicitly `os.chmod()` the restored file
-  using the `mode` recorded in its inventory record (though for local,
-  `shutil.copy2` already preserves the source file's mode as a side effect
-  regardless, unlike S3/Globus's fresh downloads).
+- **All files**, whichever storage path they took:
+  `restore_file_permissions()` (`archive_common.py`, shared by all three
+  restore scripts) `os.chmod()`s each restored file to its recorded `mode`
+  once all content is written. Symlinks are skipped — `os.chmod()` follows
+  the link and would change the *target's* mode, and a symlink's own bits
+  are meaningless on Linux.
+- **Large files** (their own S3/Globus/local object) are *also* chmod'ed at
+  download time by `download_file_from_s3()` (`restore_from_s3.py`), the
+  post-transfer pass in `restore_from_globus.py:run()`, and
+  `copy_file_from_local()` (`restore_from_local.py`). That's redundant with
+  the pass above, but harmless, and keeps each object correct the moment
+  it lands.
+- **Small files** (bundled into a tar group) *used* to rely on `tarfile`
+  reproducing `st_mode` as a side effect of `tar.extract()`. That stopped
+  being dependable: where the interpreter supports extraction filters
+  (PEP 706 — Python ≥3.12, ≥3.14 by default, and backported into some
+  distributions' 3.9), the default filter **clears permission bits**, so
+  `0664` came back as `0644` and setgid was dropped silently, while large
+  files kept theirs — two files with identical modes restoring differently
+  depending on which side of `--size-cutoff` they fell on. `--verify-checksums`
+  never caught it, since it only compares content hashes. `extract_tar()`
+  now pins `filter="fully_trusted"` where the parameter exists (these are
+  archives this tool produced, and the default filter also rejects the
+  absolute/escaping symlink targets archiveTree deliberately records), and
+  `restore_file_permissions()` makes the final mode correct regardless of
+  interpreter behavior.
+- **Ownership** (uid/gid) is *not* restored by tar extraction in practice,
+  since `tarfile.chown()` only attempts `os.chown()` when running as root.
 - **Directories**: `restore_directory_permissions()` (`archive_common.py`,
-  shared by all three restore scripts) runs once, after all file content
-  has been written (both storage paths), in two passes over
+  shared by all three restore scripts) runs once, after `restore_file_permissions()`
+  — files first, so a directory whose recorded mode lacks write/execute
+  can't block a chmod still to come inside it — in two passes over
   `directories[]`:
   1. **Create.** Tar extraction only creates the parent dirs its member
      files need, so a directory that was empty in the original tree (zero
      files anywhere in its subtree) never otherwise gets created. This
      pass `os.makedirs()`s any recorded directory that doesn't already
      exist under `restore_root` and is in scope of the restore: always, for
-     a full restore, or (for a `--only-path`/`--only-prefix` subset
-     restore) only a directory at or under one of the given
-     `--only-prefix` values — `--only-path` alone never brings an empty
-     directory into scope, since it names individual files, not trees. An
-     empty directory outside a `--only-prefix` subset is correctly left
-     uncreated, same as any file outside that subset.
+     a full restore, or (for a `--only-prefix` subset restore) only a
+     directory at or under one of the given prefixes. An empty directory
+     outside a `--only-prefix` subset is correctly left uncreated, same as
+     any file outside that subset. `--only-path` alone brings no empty
+     directory into scope, since it names individual files, not trees —
+     which requires the function to receive **both** filters: knowing only
+     about `--only-prefix` made a `--only-path`-only restore
+     indistinguishable from an unfiltered one, and it would materialize
+     the archived tree's entire directory skeleton around a single
+     restored file.
   2. **Chmod.** `os.chmod()`s every directory that has a recorded `mode`
      *and* now exists under `restore_root` (either just created above, or
      already populated by file extraction), using the mode from its
@@ -331,7 +351,18 @@ the map.
    inventory pointing at them yet) or a redundant, still-intact source
    sitting next to a complete, valid archive.
 
-5. **Independent re-verification at restore time.** `--verify-checksums`
+5. **Object-level re-check at fetch time.** `verify_object_checksum()`
+   (`archive_common.py`) compares a just-downloaded/located object against
+   whatever whole-object checksum the inventory recorded for it, before its
+   contents are trusted: `crc64nvme` for S3 objects (when the endpoint
+   supported whole-object checksums), `sha256` for local tar objects (when
+   the archive ran with `--verify-checksum`). Globus objects carry neither,
+   since Globus verifies checksums in transit itself. This runs
+   unconditionally — no flag — and is strictly cheaper and more precise
+   than (5): it catches a damaged object at the object level, where the
+   error can name it, rather than as an opaque extraction failure.
+
+6. **Independent re-verification at restore time.** `--verify-checksums`
    (all three `restore_from_*.py` scripts) runs `verify_restored_files()`
    (`archive_common.py:435`) after restore completes: it re-hashes every
    restored file (or symlink target) from disk and compares it to the
@@ -343,13 +374,21 @@ the map.
    at archive time. See step 7 of [Restore flow](#restore-flow).
 
 Together, (2)+(3) guard the archive-time path (did the bytes that left
-this machine arrive intact), and (5) guards the restore-time path (did the
-bytes that come back match what was originally read). The two are
+this machine arrive intact), while (5) and (6) guard the restore-time path
+(did the bytes that come back match what was originally read). They're
 independent checks — passing one doesn't imply the other — which is why
 `--verify-checksums` on restore still has value even for a backend (like
 Globus) that already verifies its transfers server-side: it also catches
 corruption from extraction, filesystem, or storage-at-rest issues that
 transfer-level verification can't see.
+
+One thing none of these checks cover: **permission bits**. Every one of
+them compares content, so a restore whose modes were silently altered
+passes cleanly — which is exactly how the tar-extraction filter regression
+described under [Permission handling](#permission-handling) went unnoticed.
+Mode correctness rests on `restore_file_permissions()`/
+`restore_directory_permissions()` applying what the inventory recorded, not
+on verification catching a discrepancy afterward.
 
 ## `--verbose` configuration listing
 
@@ -563,14 +602,15 @@ again all share the same shape, diverging on transfer mechanics.
    requires `archive.backend == "local"` and `archive.local_dest_dir` — before
    any script touches the objects themselves.
 
-2. **`select_relpaths()`** (`archive_common.py:405`) resolves `--only-path`
-   (exact match, repeatable) and `--only-prefix` (repeatable) against
-   `files[]`. With neither flag, everything is selected. **Note:**
-   `--only-prefix` matching is a plain `str.startswith()` — not
-   path-boundary aware — so a prefix of `logs` would also match a sibling
-   directory named `logs2`. `browse_inventory.py` works around this itself
-   by always emitting prefixes with a trailing `/`; anything calling
-   `select_relpaths()` directly should do the same.
+2. **`select_relpaths()`** resolves `--only-path` (exact match, repeatable)
+   and `--only-prefix` (repeatable) against `files[]`. With neither flag,
+   everything is selected. `--only-prefix` matching goes through
+   `path_matches_prefix()`, which is **path-boundary aware**: a prefix of
+   `logs` selects `logs` and everything under `logs/`, but not a sibling
+   `logs2`. (It was a plain `str.startswith()` originally, which silently
+   over-restored into any same-prefixed sibling; `browse_inventory.py`
+   works around that by always emitting a trailing `/`, which remains
+   correct — trailing slashes are ignored.)
 
 3. **Group selected files by object**: for each selected relpath, look up
    its `object_id` and bucket relpaths into `object_to_relpaths: dict[object_id, set[relpath]]`.
@@ -619,11 +659,21 @@ again all share the same shape, diverging on transfer mechanics.
      file; copying it to `--scratch-dir` first would just be a redundant
      local-to-local copy.
 
-6. **`restore_directory_permissions()`** (`archive_common.py`, unconditional,
-   no flag): creates any recorded, in-scope directory that doesn't already
-   exist (e.g. one that was empty in the original tree), then `os.chmod()`s
-   every directory with a recorded `mode` that now exists under
-   `restore_root`, deepest-first. See
+   In all three cases, an object that carries a whole-object checksum in
+   its inventory record (`crc64nvme` for S3, `sha256` for local tars — see
+   [Data integrity and validation](#data-integrity-and-validation)) is
+   re-checked by `verify_object_checksum()` the moment it's fetched, before
+   anything reads its contents. A corrupt object is then reported as
+   exactly that, naming the object id, instead of surfacing as a confusing
+   tar-extraction failure or a pile of mismatched files much later.
+
+6. **`restore_file_permissions()` then `restore_directory_permissions()`**
+   (`archive_common.py`, unconditional, no flag): every restored file is
+   chmod'ed to its recorded `mode`, then any recorded, in-scope directory
+   that doesn't already exist is created (e.g. one that was empty in the
+   original tree) and every directory with a recorded `mode` under
+   `restore_root` is chmod'ed deepest-first. Files before directories, so a
+   restrictive directory mode can't block a file chmod inside it. See
    [Permission handling](#permission-handling) above.
 
 7. **Optional `--verify-checksums`**: `verify_restored_files()`
@@ -730,8 +780,9 @@ changes.
 | | S3 | Globus | Local |
 |---|---|---|---|
 | Transfer unit | Individual synchronous `boto3` calls, one per object | Batched async `TransferData` tasks (poll to completion) | Individual synchronous `shutil.copy2` calls, one per object |
-| Verification | App-level: `head_object` size check after each upload, plus a whole-object CRC64NVME checksum comparison when supported (see [Upload checksum verification](#upload-checksum-verification-s3)) | Server-side: `verify_checksum=True` / `sync_level="checksum"` on the transfer itself | App-level: destination file size check after each copy, plus an opt-in (`--verify-checksum`) SHA256 comparison against the source's already-computed inventory checksum |
-| Tiered storage | Yes — Glacier/Deep Archive preflight + restore-request flow | No such concept; Globus collections aren't tiered | No such concept; local objects are always immediately available |
+| Verification (archive) | App-level: `head_object` size check after each upload, plus a whole-object CRC64NVME checksum comparison when supported (see [Upload checksum verification](#upload-checksum-verification-s3)) | Server-side: `verify_checksum=True` / `sync_level="checksum"` on the transfer itself | App-level: destination file size check after each copy, plus an opt-in (`--verify-checksum`) SHA256 comparison against the source's already-computed inventory checksum |
+| Verification (restore) | Size check, plus `verify_object_checksum()` against the recorded `crc64nvme` when the object has one | Size/checksum verified server-side by the transfer itself; no per-object checksum is recorded to re-check | Size check, plus `verify_object_checksum()` against the recorded `sha256` when the archive ran with `--verify-checksum` |
+| Tiered storage | Yes — Glacier/Deep Archive preflight + restore-request flow. `GLACIER_IR` is *not* treated as cold: its objects are readable immediately and `RestoreObject` against them is rejected | No such concept; Globus collections aren't tiered | No such concept; local objects are always immediately available |
 | Auth | AWS profile / env creds (`boto3` default chain) | Native App OAuth device flow, cached refresh token (`globus_auth.py`) | None — just filesystem permissions on `dest_dir` |
 | Path model | Global flat key namespace (`s3_key`) | Collection-relative paths (`globus_path`); local paths must be mapped via `--source-mount`/`--dest-mount` (`globus_transfer.local_path_to_collection_relative()`) — everything you touch (source dir, scratch dir, inventory file, restore dir) must live under the configured mount, or `require_under_mount()` exits with an error | Ordinary filesystem paths (`local_path`, relative to `local_dest_dir`) — `dest_dir` must already be mounted and reachable; this tool never mounts anything itself |
 | Restore of tar objects | Downloaded to `--scratch-dir`, then extracted | Downloaded (via transfer task) to `--scratch-dir`, then extracted | Extracted directly from its location under `local_dest_dir` — no scratch-dir copy at all, since the object is already local |

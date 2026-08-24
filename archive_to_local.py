@@ -101,6 +101,54 @@ def copy_file_to_local(src_path, dest_path, verbose=False, label="Copy",
     return dest_size
 
 
+def check_dest_not_nested(root_dir, dest_dir):
+    """
+    Return an error string if root_dir and dest_dir overlap, else None.
+
+    Archiving a tree into a destination inside that same tree is
+    unrecoverable with --delete: objects are written under dest_dir, and
+    then shutil.rmtree(root_dir) deletes the source *and* the archive that
+    was just written into it, leaving only an inventory pointing at objects
+    that no longer exist -- and the run still reports success. The reverse
+    nesting (archiving a directory that contains, or is, the destination)
+    is equally broken: the walk would try to pick up objects as they're
+    being written.
+
+    Unlike S3/Globus, whose destinations can't overlap the source by
+    construction, the local backend's dest_dir is an ordinary path on the
+    same filesystem, so nothing else rules this out.
+    """
+    root_dir = os.path.abspath(root_dir)
+    dest_dir = os.path.abspath(dest_dir)
+
+    if dest_dir == root_dir:
+        return (
+            f"destination directory {dest_dir!r} is the same as the directory "
+            "being archived. Choose a destination outside the source tree."
+        )
+    if _is_under(dest_dir, root_dir):
+        return (
+            f"destination directory {dest_dir!r} is inside the directory being "
+            f"archived ({root_dir!r}). The archive would be written into the "
+            "source tree, and --delete would then destroy both. Choose a "
+            "destination outside the source tree."
+        )
+    if _is_under(root_dir, dest_dir):
+        return (
+            f"directory being archived {root_dir!r} is inside the destination "
+            f"directory ({dest_dir!r}). Archive objects would be written into "
+            "the tree currently being walked. Choose a destination outside "
+            "the source tree."
+        )
+    return None
+
+
+def _is_under(path, prefix):
+    """True if abspath `path` lies strictly beneath `prefix`."""
+    rel = os.path.relpath(path, prefix)
+    return rel != os.curdir and not rel.startswith(os.pardir + os.sep) and rel != os.pardir
+
+
 def probe_write_access(dest_dir, verbose=False):
     """
     Verify dest_dir is actually writable by creating and removing a tiny
@@ -239,6 +287,13 @@ def run(args):
         sys.exit(1)
 
     dest_dir = os.path.abspath(dest_dir)
+
+    # Pure path check, so it runs on --dry-run too: catching an overlapping
+    # source/destination is exactly the kind of thing a dry run is for.
+    nesting_error = check_dest_not_nested(root_dir, dest_dir)
+    if nesting_error:
+        print(f"ERROR: {nesting_error}", file=sys.stderr)
+        sys.exit(1)
 
     print_config(verbose, "Configuration", {
         "directory": root_dir,
@@ -383,6 +438,7 @@ def run(args):
                 tar_compression=compression,
                 verbose=verbose,
                 group_index=g_idx,
+                archive_id=archive_id,
             )
 
             tar_name = f"group_{g_idx:06d}{tar_suffix}"
@@ -477,6 +533,16 @@ def run(args):
         strict_checksum=strict_checksum,
     )
 
+    # --- SUMMARY ---------------------------------------------------------
+    # Printed before the optional delete, so it appears for every successful
+    # archive rather than only for --delete runs (the default is to keep the
+    # source, which used to return early and skip this entirely).
+    if args.summary:
+        print("\nArchive summary:")
+        print(f"  Total files:      {len(files)}")
+        print(f"  Total bytes:      {sum(rec['size_bytes'] for rec in files)}")
+        print(f"  Objects created:  {len(objects)}")
+
     # Now (optionally) delete the original directory tree
     if not args.delete:
         print("Source directory left intact (pass --delete to remove it). "
@@ -486,17 +552,6 @@ def run(args):
 
     vprint(verbose, f"Removing directory tree {root_dir}")
     shutil.rmtree(root_dir)
-
-    # --- SUMMARY ---------------------------------------------------------
-    if args.summary:
-        total_files = len(files)
-        total_bytes = sum(rec["size_bytes"] for rec in files)
-        num_objects = len(objects)
-
-        print("\nArchive summary:")
-        print(f"  Total files:      {total_files}")
-        print(f"  Total bytes:      {total_bytes}")
-        print(f"  Objects created:  {num_objects}")
 
     vprint(verbose, "Done.")
     print(f"Inventory file: {invpath}")

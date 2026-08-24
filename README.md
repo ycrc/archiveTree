@@ -56,12 +56,22 @@ lose or corrupt data:
   is uploaded and verified and the inventory itself is safely written and
   stored — so a crash mid-archive can, at worst, leave some wasted space
   behind, never a deleted source with no usable copy.
+- **Fetched objects are re-checked before they're trusted.** On restore,
+  every archive object that carries a whole-object checksum is re-verified
+  the moment it's downloaded — before anything is extracted from it — so
+  storage bit-rot or a truncated download is reported against the object
+  that's actually damaged, not as a confusing failure later on.
 - **Restores can be independently re-verified.** `--verify-checksums` on
   any restore re-hashes every restored file and compares it to the
   checksum recorded at archive time, catching corruption anywhere between
   the original archive and the restored copy — including issues the
   archive-time upload check couldn't have seen (extraction bugs, storage
   bit-rot, and the like).
+- **Permissions are restored from the inventory, not guessed.** Every
+  file's and directory's recorded POSIX mode is reapplied explicitly after
+  a restore, so permission bits survive the round trip regardless of how
+  the file was stored (bundled in a tar or as its own object) or which
+  Python version does the extracting.
 
 For the exact mechanics behind each of these — which function does what,
 and why S3 needs a different checksum algorithm than the other two
@@ -347,7 +357,7 @@ archive_to_s3.py [options] directory [bucket] [object_path]
 | `directory` | Directory tree to archive. |
 | `bucket` | S3 bucket name. Optional if `bucket` is set in the `[s3]` section of the config file. |
 | `object_path` | Base S3 prefix under which archive objects are stored. Optional if `object_path` is set in the `[s3]` section of the config file. |
-| `--storage-class` | S3 storage class (`STANDARD`, `STANDARD_IA`, `ONEZONE_IA`, `INTELLIGENT_TIERING`, `GLACIER`, `GLACIER_IR`, `DEEP_ARCHIVE`). Default `STANDARD`. |
+| `--storage-class` | S3 storage class (`STANDARD`, `STANDARD_IA`, `ONEZONE_IA`, `INTELLIGENT_TIERING`, `GLACIER`, `GLACIER_IR`, `DEEP_ARCHIVE`). Falls back to `storage_class` in the `[s3]` config section, then `STANDARD`. The flag always wins over the config file, including when you pass `STANDARD` explicitly. |
 | `--scratch-dir` | Where local tars are built (default: system temp). |
 | `--compression {none,gz}` | Tar compression. Default `none`. |
 | `--delete` | Delete the source directory tree after a successful archive. Default: keep it. |
@@ -394,7 +404,7 @@ restore_from_s3.py [options] inventory_file
 | `--restore-dir` | Restore target (default: the original `root_dir` recorded in the inventory). |
 | `--overwrite` | Allow restoring into a non-empty directory. |
 | `--only-path PATH` | Restore only this relative path (repeatable). |
-| `--only-prefix PREFIX` | Restore only paths starting with this prefix (repeatable). |
+| `--only-prefix PREFIX` | Restore only paths at or under this prefix (repeatable). Matched on path boundaries, so `logs` selects `logs/` but not a sibling `logs2`. |
 | `--verify-checksums` | Re-hash restored files and compare to the inventory. |
 | `--summary-csv PATH` | Write a CSV summary (`relative_path,full_path,size_bytes,verify_status`). |
 | `--keep-tar` | Don't delete downloaded tars after restore. |
@@ -416,11 +426,13 @@ python3 restore_from_s3.py --profile ycrcbjornson \
     --summary-csv restore.csv mydata.inventory.<uuid>.json.gz
 ```
 
-If any archived object is in `GLACIER`/`DEEP_ARCHIVE`/`GLACIER_IR` and not
-yet restored, the script prints each object's status and exits without
-downloading anything — pass `--auto-request-restore` to submit the restore
-requests, wait for AWS to complete them (can take hours, depending on
-`--restore-tier`), then rerun the same command.
+If any archived object is in `GLACIER`/`DEEP_ARCHIVE` and not yet restored,
+the script prints each object's status and exits without downloading
+anything — pass `--auto-request-restore` to submit the restore requests,
+wait for AWS to complete them (can take hours, depending on
+`--restore-tier`), then rerun the same command. `GLACIER_IR` (Glacier
+Instant Retrieval) needs none of this: despite the name, its objects are
+readable immediately, so they're treated as ready and downloaded directly.
 
 ### `list_object_status.py`
 
@@ -447,6 +459,13 @@ end-to-end without any credentials at all. `archive_to_local.py` verifies
 permissions check) before doing any inventorying or tar-building, so an
 unmounted or read-only destination fails immediately instead of after
 however long walking and hashing the whole tree took.
+
+It also refuses to run if `dest_dir` and the directory being archived
+overlap in either direction. Unlike S3 and Globus, whose destinations
+can't sit inside the source by construction, a local `dest_dir` is just
+another path on the same filesystem — and archiving a tree into itself is
+unrecoverable with `--delete`, which would remove the source *and* the
+archive just written into it.
 
 Fill in the `[local]` section of your config file (see
 [Configuration file](#configuration-file) above) to avoid passing `dest_dir`
@@ -513,7 +532,7 @@ from its location under `dest_dir` instead of being copied to
 | `--restore-dir` | Restore target (default: the original `root_dir` recorded in the inventory). |
 | `--overwrite` | Allow restoring into a non-empty directory. |
 | `--only-path PATH` | Restore only this relative path (repeatable). |
-| `--only-prefix PREFIX` | Restore only paths starting with this prefix (repeatable). |
+| `--only-prefix PREFIX` | Restore only paths at or under this prefix (repeatable). Matched on path boundaries, so `logs` selects `logs/` but not a sibling `logs2`. |
 | `--verify-checksums` | Re-hash restored files and compare to the inventory. |
 | `--summary-csv PATH` | Write a CSV summary (`relative_path,full_path,size_bytes,verify_status`). |
 | `--dry-run` | Preview the plan; no copies, extraction, or writes. |

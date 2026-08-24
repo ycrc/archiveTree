@@ -37,8 +37,10 @@ from archive_common import (
     print_config,
     select_relpaths,
     extract_tar,
+    verify_object_checksum,
     verify_restored_files,
     restore_directory_permissions,
+    restore_file_permissions,
     write_summary_csv,
     check_inventory_version,
     load_inventory_file,
@@ -333,6 +335,7 @@ def run(args):
                     verbose=verbose,
                     mode=mode,
                 )
+                verify_object_checksum(dest, obj, verbose=verbose)
 
         elif otype == "tar":
             vprint(verbose, f"[worker] Restoring tar object_id={oid} ({src_path})")
@@ -345,6 +348,10 @@ def run(args):
                         f"Tar size mismatch for {src_path}: "
                         f"expected {obj_size}, got {actual_size}"
                     )
+            # Check the stored object against the whole-object checksum
+            # recorded at archive time (present when the archive ran with
+            # --verify-checksum) before trusting its contents.
+            verify_object_checksum(src_path, obj, verbose=verbose)
             extract_tar(src_path, restore_root, selected_relpaths=rels, verbose=verbose)
 
         else:
@@ -361,10 +368,14 @@ def run(args):
         for fut in as_completed(futures):
             fut.result()
 
-    # Restore directory permissions now that all file content has been
-    # written (deepest-first, so a restrictive parent mode never blocks
-    # writes still to come inside it).
-    restore_directory_permissions(inventory, restore_root, only_prefixes=args.only_prefix, verbose=verbose)
+    # Restore permission bits now that all file content has been written:
+    # files first, then directories deepest-first, so a restrictive
+    # directory mode never blocks a chmod still to come inside it.
+    restore_file_permissions(inventory, restore_root, subset_relpaths=selected_relpaths, verbose=verbose)
+    restore_directory_permissions(
+        inventory, restore_root, only_prefixes=args.only_prefix,
+        only_paths=args.only_path, verbose=verbose,
+    )
 
     # Optional checksum verification
     verify_status = {}

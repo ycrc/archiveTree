@@ -101,13 +101,31 @@ def get_transfer_client(client_id, cache_path=DEFAULT_TOKEN_CACHE, verbose=False
             cache_path=cache_path,
         )
 
-    authorizer = globus_sdk.RefreshTokenAuthorizer(
-        tokens["refresh_token"],
-        auth_client,
-        access_token=tokens["access_token"],
-        expires_at=tokens["expires_at_seconds"],
-        on_refresh=on_refresh,
-    )
+    def build_authorizer(tok):
+        return globus_sdk.RefreshTokenAuthorizer(
+            tok["refresh_token"],
+            auth_client,
+            access_token=tok["access_token"],
+            expires_at=tok["expires_at_seconds"],
+            on_refresh=on_refresh,
+        )
+
+    try:
+        authorizer = build_authorizer(tokens)
+    except globus_sdk.AuthAPIError as e:
+        # The cached refresh token is no longer usable -- revoked from the
+        # Globus web console, expired after a long idle period, or issued
+        # for a different client_id. Recover the same way the transfer
+        # scripts recover from ConsentRequired: say what happened and log
+        # in again, rather than surfacing a bare AuthAPIError traceback the
+        # user has to decode into "run --globus-logout".
+        print(
+            f"Cached Globus login at {cache_path} is no longer valid ({e.code or e}); "
+            "starting a fresh login...\n"
+        )
+        tokens = interactive_login(client_id, cache_path=cache_path, login_domain=login_domain)
+        authorizer = build_authorizer(tokens)
+
     return globus_sdk.TransferClient(authorizer=authorizer)
 
 

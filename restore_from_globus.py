@@ -41,6 +41,7 @@ from archive_common import (
     extract_tar,
     verify_restored_files,
     restore_directory_permissions,
+    restore_file_permissions,
     write_summary_csv,
     check_inventory_version,
     load_inventory_file,
@@ -501,10 +502,14 @@ def run(args):
             for t in temp_tars:
                 vprint(verbose, f"  {t}")
 
-    # Restore directory permissions now that all file content has been
-    # written (deepest-first, so a restrictive parent mode never blocks
-    # writes still to come inside it).
-    restore_directory_permissions(inventory, restore_root, only_prefixes=args.only_prefix, verbose=verbose)
+    # Restore permission bits now that all file content has been written:
+    # files first, then directories deepest-first, so a restrictive
+    # directory mode never blocks a chmod still to come inside it.
+    restore_file_permissions(inventory, restore_root, subset_relpaths=selected_relpaths, verbose=verbose)
+    restore_directory_permissions(
+        inventory, restore_root, only_prefixes=args.only_prefix,
+        only_paths=args.only_path, verbose=verbose,
+    )
 
     # Optional checksum verification
     max_workers = max(1, args.max_workers)

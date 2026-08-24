@@ -382,6 +382,7 @@ def run(args):
         tar_path = create_tar(
             root_dir, abs_paths, scratch_dir=scratch_dir,
             tar_compression=compression, verbose=verbose, group_index=g_idx,
+            archive_id=archive_id,
         )
         job["tar_path"] = tar_path
         job["tar_size"] = os.path.getsize(tar_path)
@@ -551,6 +552,16 @@ def run(args):
         login_domain=login_domain,
     )
 
+    # --- SUMMARY -------------------------------------------------------
+    # Printed before the optional delete, so it appears for every successful
+    # archive rather than only for --delete runs (the default is to keep the
+    # source, which used to return early and skip this entirely).
+    if args.summary:
+        print("\nArchive summary:")
+        print(f"  Total files:      {len(files)}")
+        print(f"  Total bytes:      {sum(rec['size_bytes'] for rec in files)}")
+        print(f"  Objects created:  {len(objects)}")
+
     # Now (optionally) delete the original directory tree
     if not args.delete:
         print("Source directory left intact (pass --delete to remove it). "
@@ -560,17 +571,6 @@ def run(args):
 
     vprint(verbose, f"Removing directory tree {root_dir}")
     shutil.rmtree(root_dir)
-
-    # --- SUMMARY -------------------------------------------------------
-    if args.summary:
-        total_files = len(files)
-        total_bytes = sum(rec["size_bytes"] for rec in files)
-        num_objects = len(objects)
-
-        print("\nArchive summary:")
-        print(f"  Total files:      {total_files}")
-        print(f"  Total bytes:      {total_bytes}")
-        print(f"  Objects created:  {num_objects}")
 
     vprint(verbose, "Done.")
     print(f"Inventory file: {invpath}")

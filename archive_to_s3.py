@@ -66,7 +66,9 @@ from archive_common import (
     vprint,
     print_config,
     build_inventory,
+    compute_crc64nvme_b64,
     create_tar,
+    crt_checksums,
     partition_by_size,
     group_small_files,
     write_inventory_file,
@@ -78,45 +80,12 @@ try:
 except ImportError:
     tqdm = None
 
-# Optional awscrt, required to compute CRC64NVME checksums locally (S3's
-# boto3 SDK also needs it to compute CRC64NVME on the wire, so if it's
-# missing here it's missing there too, and whole-object checksums degrade
-# to size-only verification).
-try:
-    from awscrt import checksums as crt_checksums
-except ImportError:
-    crt_checksums = None
-
-GLACIER_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"}
-
-
-def compute_crc64nvme_b64(path, verbose=False, use_tqdm=True):
-    """
-    Compute the CRC64NVME checksum of a local file, base64-encoded to match
-    S3's ChecksumCRC64NVME response field.
-    """
-    filesize = os.path.getsize(path)
-    crc = 0
-
-    show_bar = verbose and tqdm and use_tqdm
-    pbar = tqdm(total=filesize, unit="B", unit_scale=True,
-                desc=f"crc64nvme {os.path.basename(path)}") if show_bar else None
-
-    chunk_size = 8 * 1024 * 1024
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            crc = crt_checksums.crc64nvme(chunk, crc) & 0xFFFFFFFFFFFFFFFF
-            if pbar:
-                pbar.update(len(chunk))
-
-    if pbar:
-        pbar.close()
-
-    digest = crc.to_bytes(8, byteorder="big")
-    return base64.b64encode(digest).decode("ascii")
+# Storage classes that keep objects offline until an explicit restore
+# request completes. GLACIER_IR (Glacier Instant Retrieval) is deliberately
+# NOT here: despite the name, its objects are readable immediately with a
+# plain GET and RestoreObject against them is rejected outright, so treating
+# it as cold would make anything archived that way permanently unreadable.
+RESTORE_REQUIRED_CLASSES = {"GLACIER", "DEEP_ARCHIVE"}
 
 
 # ---------- S3 + Progress ----------
@@ -331,7 +300,7 @@ def upload_file_to_s3(path, bucket, key, storage_class, s3_client,
             )
         vprint(verbose, f"Verified CRC64NVME checksum for s3://{bucket}/{key}.")
 
-    if remote_storage_class in GLACIER_CLASSES:
+    if remote_storage_class in RESTORE_REQUIRED_CLASSES:
         vprint(
             verbose,
             f"NOTE: s3://{bucket}/{key} is stored in {remote_storage_class}. "
@@ -364,10 +333,11 @@ def build_arg_parser():
     )
     parser.add_argument(
         "--storage-class",
-        default="STANDARD",
+        default=None,
         help=("""S3 storage class for newly created objects.
             Examples: STANDARD, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING,
-            GLACIER, GLACIER_IR, DEEP_ARCHIVE. Default: STANDARD. """
+            GLACIER, GLACIER_IR, DEEP_ARCHIVE. Falls back to 'storage_class'
+            in the [s3] section of the config file, then STANDARD. """
          ),
     )
     parser.add_argument("--scratch-dir", default=None)
@@ -463,11 +433,15 @@ def run(args):
     )
     profile = args.profile or s3_config.get("profile")
     endpoint_url = args.endpoint_url or s3_config.get("endpoint_url")
-    storage_class = (
-        args.storage_class
-        if args.storage_class != "STANDARD" or "storage_class" not in s3_config
-        else s3_config.get("storage_class")
-    )
+    # --storage-class defaults to None rather than "STANDARD" so an explicit
+    # "--storage-class STANDARD" is distinguishable from the flag being
+    # absent. Comparing against the literal default instead made the config
+    # file silently outrank the command line for that one value -- asking
+    # for STANDARD while the config said DEEP_ARCHIVE got you DEEP_ARCHIVE,
+    # with its 180-day minimum billing and hours-long retrieval.
+    storage_class = archive_config.resolve(
+        args.storage_class, None, s3_config, "storage_class"
+    ) or "STANDARD"
 
     root_dir = os.path.abspath(args.directory)
 
@@ -701,6 +675,7 @@ def run(args):
                 tar_compression=compression,
                 verbose=verbose,
                 group_index=g_idx,
+                archive_id=archive_id,
             )
 
             tar_name = f"group_{g_idx:06d}{tar_suffix}"
@@ -806,6 +781,16 @@ def run(args):
         strict_checksum=strict_checksum,
     )
 
+    # --- SUMMARY ---------------------------------------------------------
+    # Printed before the optional delete, so it appears for every successful
+    # archive rather than only for --delete runs (the default is to keep the
+    # source, which used to return early and skip this entirely).
+    if args.summary:
+        print("\nArchive summary:")
+        print(f"  Total files:      {len(files)}")
+        print(f"  Total bytes:      {sum(rec['size_bytes'] for rec in files)}")
+        print(f"  Objects created:  {len(objects)}")
+
     # Now (optionally) delete the original directory tree
     if not args.delete:
         print("Source directory left intact (pass --delete to remove it). "
@@ -815,17 +800,6 @@ def run(args):
 
     vprint(verbose, f"Removing directory tree {root_dir}")
     shutil.rmtree(root_dir)
-
-    # --- SUMMARY ---------------------------------------------------------
-    if args.summary:
-        total_files = len(files)
-        total_bytes = sum(rec["size_bytes"] for rec in files)
-        num_objects = len(objects)
-
-        print("\nArchive summary:")
-        print(f"  Total files:      {total_files}")
-        print(f"  Total bytes:      {total_bytes}")
-        print(f"  Objects created:  {num_objects}")
 
     vprint(verbose, "Done.")
     print(f"Inventory file: {invpath}")

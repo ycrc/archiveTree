@@ -260,7 +260,12 @@ def restore_command_groups(inventory_path, inventory, dir_prefixes, file_paths,
         cmd_groups.append(f"--only-path {shlex.quote(f)}")
     if verbose:
         cmd_groups.append("--verbose")
-    cmd_groups.append('--max-workers "$SLURM_CPUS_PER_TASK"')
+    # ${VAR:-default} rather than a bare $VAR: the script sets `set -u`, and
+    # SLURM_CPUS_PER_TASK only exists under a Slurm allocation, so a bare
+    # reference aborts the script with "unbound variable" when it's run
+    # directly instead of submitted with sbatch -- which is exactly how the
+    # README suggests running it for a small restore.
+    cmd_groups.append('--max-workers "${SLURM_CPUS_PER_TASK:-4}"')
     return cmd_groups
 
 

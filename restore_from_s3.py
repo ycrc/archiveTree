@@ -43,8 +43,10 @@ from archive_common import (
     print_config,
     select_relpaths,
     extract_tar,
+    verify_object_checksum,
     verify_restored_files,
     restore_directory_permissions,
+    restore_file_permissions,
     write_summary_csv,
     check_inventory_version,
     load_inventory_file,
@@ -59,7 +61,14 @@ except ImportError:
     tqdm = None
 
 
-GLACIER_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"}
+# Storage classes whose objects are offline until an explicit restore
+# request completes. GLACIER_IR (Glacier Instant Retrieval) is deliberately
+# NOT here: its objects are readable immediately with a plain GET, report no
+# Restore header, and RestoreObject against them is rejected outright.
+# Treating it as cold classified every such object as "cold" forever, so the
+# preflight refused to download and --auto-request-restore couldn't help --
+# making anything archived with --storage-class GLACIER_IR unrestorable.
+RESTORE_REQUIRED_CLASSES = {"GLACIER", "DEEP_ARCHIVE"}
 
 
 # ---------- Utility ----------
@@ -132,8 +141,8 @@ def classify_object_status(bucket, key, s3_client, verbose=False):
     storage_class = resp.get("StorageClass", "STANDARD")
     restore_hdr = resp.get("Restore")
 
-    if storage_class not in GLACIER_CLASSES:
-        # Not in a Glacier class; ready to download
+    if storage_class not in RESTORE_REQUIRED_CLASSES:
+        # Immediately retrievable (STANDARD, IA, GLACIER_IR, ...)
         vprint(verbose, f"s3://{bucket}/{key} is in {storage_class} and ready.")
         return {
             "status": "ready",
@@ -748,6 +757,7 @@ def run(args):
                     verbose=verbose,
                     mode=mode,
                 )
+                verify_object_checksum(dest, obj, verbose=verbose)
             return None
 
         elif otype == "tar":
@@ -760,6 +770,12 @@ def run(args):
                 expected_size=obj_size,
                 verbose=verbose,
             )
+
+            # Check the downloaded object against the whole-object checksum
+            # recorded at archive time (when there is one) before trusting
+            # its contents -- a corrupt tar is worth reporting as such,
+            # rather than as a confusing extraction failure.
+            verify_object_checksum(tar_path, obj, verbose=verbose)
 
             extract_tar(tar_path, restore_root, selected_relpaths=rels, verbose=verbose)
 
@@ -789,10 +805,14 @@ def run(args):
             if tpath:
                 temp_tars.append(tpath)
 
-    # Restore directory permissions now that all file content has been
-    # written (deepest-first, so a restrictive parent mode never blocks
-    # writes still to come inside it).
-    restore_directory_permissions(inventory, restore_root, only_prefixes=args.only_prefix, verbose=verbose)
+    # Restore permission bits now that all file content has been written:
+    # files first, then directories deepest-first, so a restrictive
+    # directory mode never blocks a chmod still to come inside it.
+    restore_file_permissions(inventory, restore_root, subset_relpaths=selected_relpaths, verbose=verbose)
+    restore_directory_permissions(
+        inventory, restore_root, only_prefixes=args.only_prefix,
+        only_paths=args.only_path, verbose=verbose,
+    )
 
     # Optional checksum verification
     verify_status = {}

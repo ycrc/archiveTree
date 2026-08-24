@@ -14,8 +14,10 @@ download logic stays in the individual archive_to_*.py / restore_from_*.py
 scripts.
 """
 
+import base64
 import os
 import sys
+import inspect
 import json
 import gzip
 import uuid
@@ -25,7 +27,7 @@ import tempfile
 import stat
 import pwd
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Optional tqdm for progress bars
@@ -33,6 +35,25 @@ try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None
+
+# Optional awscrt, required to compute CRC64NVME checksums locally. Used by
+# the S3 backend to verify uploads, and by the S3 restore path to re-check a
+# downloaded object against the checksum recorded in the inventory. Neither
+# boto3 nor globus_sdk is imported here (see module docstring); awscrt is a
+# standalone, optional checksum library.
+try:
+    from awscrt import checksums as crt_checksums
+except ImportError:
+    crt_checksums = None
+
+# tarfile.TarFile.extract() grew a `filter` parameter in Python 3.11.4/3.12
+# (PEP 706), and some distributions (notably RHEL) backported it into 3.9.
+# Where it exists, the *default* filter clears permission bits ("some mode
+# bits are cleared") and rejects absolute/escaping symlink targets, which
+# silently degrades restore fidelity -- see extract_tar().
+TARFILE_SUPPORTS_FILTER = (
+    "filter" in inspect.signature(tarfile.TarFile.extract).parameters
+)
 
 
 # ---------- Utility ----------
@@ -84,6 +105,82 @@ def compute_sha256(path, verbose=False, use_tqdm=True):
     return h.hexdigest()
 
 
+def compute_crc64nvme_b64(path, verbose=False, use_tqdm=True):
+    """
+    Compute the CRC64NVME checksum of a local file, base64-encoded to match
+    S3's ChecksumCRC64NVME response field. Requires the optional `awscrt`
+    package; callers must check crt_checksums is not None first.
+    """
+    filesize = os.path.getsize(path)
+    crc = 0
+
+    show_bar = verbose and tqdm and use_tqdm
+    pbar = tqdm(total=filesize, unit="B", unit_scale=True,
+                desc=f"crc64nvme {os.path.basename(path)}") if show_bar else None
+
+    chunk_size = 8 * 1024 * 1024
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            crc = crt_checksums.crc64nvme(chunk, crc) & 0xFFFFFFFFFFFFFFFF
+            if pbar:
+                pbar.update(len(chunk))
+
+    if pbar:
+        pbar.close()
+
+    digest = crc.to_bytes(8, byteorder="big")
+    return base64.b64encode(digest).decode("ascii")
+
+
+def verify_object_checksum(local_path, obj, verbose=False):
+    """
+    Re-check a just-fetched archive object against whatever whole-object
+    checksum the inventory recorded for it at archive time, before its
+    contents are trusted (extracted, or accepted as a restored file).
+
+    This is a cheaper and more precise check than --verify-checksums: it
+    catches a corrupted download/copy at the object level, where the error
+    message can name the object, instead of surfacing later as a pile of
+    mismatched files -- or, for a damaged tar, as an extraction failure
+    with no indication of why.
+
+    Not every object carries one: S3 objects have "crc64nvme" only when the
+    endpoint supported whole-object checksums, local tar objects have
+    "sha256" only when --verify-checksum was used, and Globus objects have
+    neither (Globus verifies checksums in transit itself). Returns the name
+    of the algorithm actually checked, or None when the object carries no
+    usable checksum. Raises RuntimeError on mismatch.
+    """
+    expected_sha = obj.get("sha256")
+    if expected_sha:
+        actual = compute_sha256(local_path, verbose=verbose, use_tqdm=False)
+        if actual != expected_sha:
+            raise RuntimeError(
+                f"Checksum verification FAILED for archived object "
+                f"{obj.get('id', '?')} at {local_path}: expected "
+                f"sha256={expected_sha}, got {actual}."
+            )
+        vprint(verbose, f"Verified sha256 for object {obj.get('id', '?')}.")
+        return "sha256"
+
+    expected_crc = obj.get("crc64nvme")
+    if expected_crc and crt_checksums is not None:
+        actual = compute_crc64nvme_b64(local_path, verbose=verbose, use_tqdm=False)
+        if actual != expected_crc:
+            raise RuntimeError(
+                f"Checksum verification FAILED for archived object "
+                f"{obj.get('id', '?')} at {local_path}: expected "
+                f"crc64nvme={expected_crc}, got {actual}."
+            )
+        vprint(verbose, f"Verified crc64nvme for object {obj.get('id', '?')}.")
+        return "crc64nvme"
+
+    return None
+
+
 def get_owner(stat_result):
     """Get username from stat, fall back to uid."""
     try:
@@ -98,7 +195,8 @@ def _checksum_one(path, root_dir, verbose=False):
     """
     Compute the inventory record for a single path.
 
-    Returns (record, path) on success, or (None, path) if the file vanished.
+    Returns (record, path, None) on success, or (None, path, skip_reason) if
+    the file vanished, isn't a regular file/symlink, or couldn't be read.
     Designed to be called from a thread pool.
     """
     root_dir = os.path.abspath(root_dir)
@@ -274,7 +372,7 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
     inventory = {
         "inventory_id": str(uuid.uuid4()),
         "root_dir": root_dir,
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
         "total_files": len(file_records),
         "total_bytes": sum(r["size_bytes"] for r in file_records),
         "files": file_records,
@@ -313,8 +411,20 @@ def group_small_files(small_files, size_grouping):
 
 
 def create_tar(root_dir, abs_paths, scratch_dir=None, tar_compression=None,
-               verbose=False, group_index=None):
-    """Tar up a subset of files with optional progress bar."""
+               verbose=False, group_index=None, archive_id=None):
+    """
+    Tar up a subset of files with optional progress bar.
+
+    archive_id (the inventory's UUID) is included in the local scratch
+    filename to keep concurrent archive runs from colliding: the name is
+    otherwise derived only from the source directory's basename and the
+    group index, so two runs over the same tree -- or over two different
+    trees with the same basename -- sharing a scratch directory (the system
+    temp dir, by default) would write to the same path and clobber each
+    other's tars mid-upload. It affects only this local filename, never the
+    object key/path recorded in the inventory, which callers build
+    separately.
+    """
     root_dir = os.path.abspath(root_dir)
     base_name = os.path.basename(root_dir.rstrip(os.sep))
     suffix = ".tar.gz" if tar_compression == "gz" else ".tar"
@@ -326,6 +436,8 @@ def create_tar(root_dir, abs_paths, scratch_dir=None, tar_compression=None,
         name_part = uuid.uuid4().hex
     else:
         name_part = f"group_{group_index:06d}"
+    if archive_id:
+        name_part = f"{archive_id}_{name_part}"
     tar_path = os.path.join(scratch_dir, f"{base_name}_{name_part}{suffix}")
 
     mode = "w:gz" if tar_compression == "gz" else "w"
@@ -356,11 +468,24 @@ def _extract_member(tar, member, restore_root):
     A single retry is always safe here: by the time the exception is
     raised, the directory has already been created by the winning thread,
     so the retried extract() sees it exists and proceeds normally.
+
+    Extraction is pinned to the "fully_trusted" filter wherever the running
+    interpreter supports one (see TARFILE_SUPPORTS_FILTER). These tars are
+    produced by this tool from a tree it just walked, not fetched from an
+    untrusted third party, and the default filter actively damages a
+    restore: it clears permission bits (0664 comes back as 0644, setgid is
+    dropped entirely) and rejects symlinks whose targets are absolute or
+    point outside the tree -- both of which archiveTree deliberately records
+    and is expected to reproduce. Pinning it also makes behavior
+    independent of the interpreter's patch level, rather than silently
+    changing when a distro backports PEP 706 or the default flips in
+    Python 3.14.
     """
+    kwargs = {"filter": "fully_trusted"} if TARFILE_SUPPORTS_FILTER else {}
     try:
-        tar.extract(member, path=restore_root)
+        tar.extract(member, path=restore_root, **kwargs)
     except FileExistsError:
-        tar.extract(member, path=restore_root)
+        tar.extract(member, path=restore_root, **kwargs)
 
 
 def extract_tar(tar_path, restore_root, selected_relpaths=None, verbose=False):
@@ -425,6 +550,23 @@ def restore_script_for_backend(backend):
     )
 
 
+def path_matches_prefix(relpath, prefix):
+    """
+    True if relpath is `prefix` itself or lies beneath it, matching on path
+    boundaries rather than raw string prefixes.
+
+    A plain str.startswith() would make --only-prefix 'logs' also select a
+    sibling directory named 'logs2' (and 'logs.bak', 'logsomething', ...),
+    silently restoring far more than asked for. Trailing slashes on the
+    given prefix are ignored, so 'logs' and 'logs/' behave identically --
+    browse_inventory.py emits the latter.
+    """
+    pref = prefix.rstrip("/")
+    if not pref:
+        return True
+    return relpath == pref or relpath.startswith(pref + "/")
+
+
 def select_relpaths(inventory, only_paths=None, only_prefixes=None, verbose=False):
     """
     Determine which relative paths from the inventory to restore,
@@ -446,7 +588,7 @@ def select_relpaths(inventory, only_paths=None, only_prefixes=None, verbose=Fals
                     vprint(verbose, f"WARNING: --only-path '{p}' not found in inventory.")
         if only_prefixes:
             for pref in only_prefixes:
-                matched = [rp for rp in all_relpaths if rp.startswith(pref)]
+                matched = [rp for rp in all_relpaths if path_matches_prefix(rp, pref)]
                 if not matched:
                     vprint(verbose, f"WARNING: --only-prefix '{pref}' matched no files.")
                 selected.update(matched)
@@ -573,20 +715,71 @@ def verify_restored_files(inventory, restore_root,
     return status_map
 
 
-def restore_directory_permissions(inventory, restore_root, only_prefixes=None, verbose=False):
+def restore_file_permissions(inventory, restore_root, subset_relpaths=None, verbose=False):
+    """
+    Apply each restored file's recorded POSIX permission bits, from its
+    inventory record's "mode" field.
+
+    Files restored as their own object are already chmod'ed by the backend
+    that downloaded them, but files that travelled inside a tar group are
+    not: they get whatever tarfile's extraction produced. That used to be
+    the original mode by happy accident, but is no longer dependable --
+    where the interpreter supports extraction filters, the default one
+    clears permission bits, so 0664 comes back as 0644 and setgid is
+    dropped. extract_tar() pins the trusted filter to avoid that, and this
+    pass makes the outcome correct regardless of interpreter behavior, by
+    applying the mode the inventory actually recorded.
+
+    Applied before restore_directory_permissions(), so a directory whose
+    recorded mode lacks write/execute doesn't block chmod'ing the files
+    inside it. Symlinks are skipped: os.chmod() would follow the link and
+    change the *target's* mode, and a symlink's own bits aren't meaningful
+    on Linux anyway. Best-effort -- a failure warns rather than aborting a
+    restore whose file contents are already correct and verified.
+    """
+    records_by_rel = {rec["relative_path"]: rec for rec in inventory.get("files", [])}
+    if subset_relpaths is None:
+        target_relpaths = records_by_rel.keys()
+    else:
+        target_relpaths = [rp for rp in subset_relpaths if rp in records_by_rel]
+
+    applied = 0
+    for relpath in target_relpaths:
+        rec = records_by_rel[relpath]
+        mode = rec.get("mode")
+        if mode is None or rec.get("is_symlink", False):
+            continue
+        full_path = os.path.join(restore_root, relpath)
+        if not os.path.isfile(full_path) or os.path.islink(full_path):
+            continue
+        try:
+            os.chmod(full_path, mode)
+            applied += 1
+        except OSError as e:
+            print(f"WARNING: failed to restore permissions on {full_path}: {e}", file=sys.stderr)
+
+    vprint(verbose, f"Restored permission bits on {applied} file(s).")
+
+
+def restore_directory_permissions(inventory, restore_root, only_prefixes=None,
+                                  only_paths=None, verbose=False):
     """
     Create any recorded directory that's empty (tar extraction only creates
     the parent dirs its member files need, so nothing else ever creates an
     originally-empty directory), then best-effort restore each directory's
     recorded POSIX permission bits.
 
-    only_prefixes should be the same --only-prefix values (if any) the
-    restore itself was filtered by. With none given (a full restore), every
-    recorded directory is in scope; otherwise only directories at or under
-    one of those prefixes are created -- e.g. an empty directory outside a
-    `--only-prefix` subset restore is correctly left uncreated, same as any
-    file outside that subset. `--only-path` (individual files, not
-    directory trees) never brings an empty directory into scope on its own.
+    only_prefixes/only_paths should be the same --only-prefix/--only-path
+    values (if any) the restore itself was filtered by. With neither given
+    (a full restore), every recorded directory is in scope. With
+    --only-prefix, only directories at or under one of those prefixes are
+    created -- an empty directory outside the subset is correctly left
+    uncreated, same as any file outside it. With only --only-path (which
+    names individual files, not trees), no empty directory is in scope at
+    all: creating them would materialize the entire archived skeleton
+    around a single restored file. Both filters must therefore be passed
+    in; knowing only about --only-prefix makes a --only-path-only restore
+    indistinguishable from an unfiltered one.
 
     Permission restoration itself still only touches directories that
     actually exist under restore_root by this point -- either just created
@@ -596,14 +789,21 @@ def restore_directory_permissions(inventory, restore_root, only_prefixes=None, v
     chmod'ing something still to come inside it.
     """
     directories = inventory.get("directories", [])
+    filtered = bool(only_prefixes or only_paths)
 
     def in_scope(relpath):
-        if not only_prefixes:
+        if not filtered:
             return True
+        if not only_prefixes:
+            # --only-path only: individual files, no directory trees.
+            return False
         stripped = relpath.rstrip("/")
         for pref in only_prefixes:
             pref_stripped = pref.rstrip("/")
-            if (relpath.startswith(pref) or stripped == pref_stripped
+            # In scope if the directory is at/under a selected prefix, or is
+            # an ancestor of one (its own recorded mode still applies to the
+            # path leading down to the subset).
+            if (path_matches_prefix(stripped, pref_stripped)
                     or pref_stripped.startswith(stripped + "/")):
                 return True
         return False

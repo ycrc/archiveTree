@@ -25,93 +25,12 @@ import argparse
 import os
 import sys
 
-import boto3
-from botocore.exceptions import ClientError
+from archive_common import check_inventory_version, load_inventory_file, vprint
 
-from archive_common import check_inventory_version, load_inventory_file
-
-GLACIER_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"}
-
-
-def vprint(verbose, *args, **kwargs):
-    if verbose:
-        print(*args, **kwargs)
-
-
-def get_s3_client(profile=None, endpoint_url=None):
-    """Create a boto3 S3 client with optional profile and endpoint."""
-    if profile:
-        session = boto3.session.Session(profile_name=profile)
-    else:
-        session = boto3.session.Session()
-
-    if endpoint_url:
-        return session.client("s3", endpoint_url=endpoint_url)
-    return session.client("s3")
-
-
-def classify_object_status(bucket, key, s3_client, verbose=False):
-    """
-    Inspect a single S3 object and classify its availability.
-
-    Returns a dict with:
-      {
-        "status": one of {"ready", "cold", "restoring", "error"},
-        "storage_class": str or None,
-        "restore_header": str or None,
-        "error": str or None,
-      }
-    """
-    try:
-        resp = s3_client.head_object(Bucket=bucket, Key=key)
-    except ClientError as e:
-        msg = f"head_object failed: {e}"
-        vprint(verbose, f"s3://{bucket}/{key}: ERROR {msg}")
-        return {
-            "status": "error",
-            "storage_class": None,
-            "restore_header": None,
-            "error": msg,
-        }
-
-    storage_class = resp.get("StorageClass", "STANDARD")
-    restore_hdr = resp.get("Restore")
-
-    if storage_class not in GLACIER_CLASSES:
-        # Not in a Glacier class; ready to download
-        return {
-            "status": "ready",
-            "storage_class": storage_class,
-            "restore_header": restore_hdr,
-            "error": None,
-        }
-
-    # In Glacier / Deep Archive
-    if restore_hdr and 'ongoing-request="false"' in restore_hdr:
-        # Already temporarily restored
-        return {
-            "status": "ready",
-            "storage_class": storage_class,
-            "restore_header": restore_hdr,
-            "error": None,
-        }
-
-    if restore_hdr and 'ongoing-request="true"' in restore_hdr:
-        # Restore in progress
-        return {
-            "status": "restoring",
-            "storage_class": storage_class,
-            "restore_header": restore_hdr,
-            "error": None,
-        }
-
-    # Cold, no restore requested yet
-    return {
-        "status": "cold",
-        "storage_class": storage_class,
-        "restore_header": restore_hdr,
-        "error": None,
-    }
+# Reuse the restore script's own classification logic rather than keeping a
+# second copy in sync by hand. The duplicate that used to live here is how
+# the GLACIER_IR misclassification ended up needing fixing in two places.
+from restore_from_s3 import classify_object_status, get_s3_client
 
 
 def main():
