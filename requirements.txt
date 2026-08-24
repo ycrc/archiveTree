@@ -3,8 +3,13 @@
 # archive_to_s3.py / restore_from_s3.py / list_object_status.py:
 boto3>=1.43
 
-# archive_to_globus.py / restore_from_globus.py / globus_auth.py / globus_transfer.py:
-globus-sdk>=3.41
+# archive_to_globus.py / restore_from_globus.py / globus_auth.py / globus_transfer.py.
+# Both the 3.x and 4.x lines are supported and in active use here: the
+# EasyBuild module gets 3.44 (via Globus-CLI), the pixi environment resolves
+# 4.x. globus_transfer.new_transfer() adapts to TransferData's signature
+# change between them at runtime. Capped below 5, which is unreleased and
+# unverified.
+globus-sdk>=3.41,<5
 
 # Optional (all scripts fall back to plain progress messages if absent, via
 # try/except ImportError) but recommended for progress bars during

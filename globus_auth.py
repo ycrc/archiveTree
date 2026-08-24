@@ -54,9 +54,15 @@ def interactive_login(client_id, scopes=TransferScopes.all, cache_path=DEFAULT_T
     """
     auth_client = globus_sdk.NativeAppAuthClient(client_id)
     auth_client.oauth2_start_flow(requested_scopes=scopes, refresh_tokens=True)
-    authorize_url = auth_client.oauth2_get_authorize_url(
-        session_required_single_domain=login_domain
+    # Only pass session_required_single_domain when there's actually a domain
+    # to require. globus-sdk v3 treated None as "not provided", but v4 uses a
+    # MISSING sentinel for that and serializes an explicit None into the
+    # authorize URL as the literal string "None" -- which would ask Globus
+    # for an identity from a domain named "None" on every ordinary login.
+    domain_kwargs = (
+        {"session_required_single_domain": login_domain} if login_domain else {}
     )
+    authorize_url = auth_client.oauth2_get_authorize_url(**domain_kwargs)
 
     print(f"Please go to this URL and login:\n\n{authorize_url}\n")
     auth_code = input("Please enter the code you get after login here: ").strip()

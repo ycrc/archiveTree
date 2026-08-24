@@ -4,6 +4,7 @@ Globus Transfer task construction/submission/polling shared by
 archive_to_globus.py and restore_from_globus.py.
 """
 
+import inspect
 import os
 import sys
 
@@ -94,16 +95,32 @@ def local_path_to_collection_relative(abs_path, local_mount_prefix, collection_b
     return "/" + collection_path.lstrip("/")
 
 
+# globus-sdk v4 removed TransferData's long-deprecated `transfer_client`
+# first parameter, so its signature became (source_endpoint,
+# destination_endpoint, *, ...). Passing a client positionally alongside
+# source_endpoint= therefore failed outright with "got multiple values for
+# argument 'source_endpoint'". Both versions are in play for this project --
+# the pixi environment resolves globus-sdk 4.x, while the EasyBuild module
+# provides 3.44 via Globus-CLI -- so detect it rather than pinning either
+# way. On v3 the client is still passed (it fetches a submission_id up front
+# for submit-retry idempotency, exactly as before); on v4 it's omitted, and
+# submit_transfer() takes care of the submission_id itself.
+_TRANSFERDATA_ACCEPTS_CLIENT = (
+    "transfer_client" in inspect.signature(globus_sdk.TransferData.__init__).parameters
+)
+
+
 def new_transfer(transfer_client, source_collection, destination_collection, label,
                   verify_checksum=True, sync_level="checksum"):
     """Build a new (empty) TransferData task, ready for add_item() calls."""
+    extra = {"transfer_client": transfer_client} if _TRANSFERDATA_ACCEPTS_CLIENT else {}
     return globus_sdk.TransferData(
-        transfer_client,
         source_endpoint=source_collection,
         destination_endpoint=destination_collection,
         label=label,
         verify_checksum=verify_checksum,
         sync_level=sync_level,
+        **extra,
     )
 
 
