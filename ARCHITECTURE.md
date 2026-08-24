@@ -269,6 +269,88 @@ matters beyond just bytes transferred:
   restored by anything in this codebase, for either storage path or either
   files/directories.
 
+## Data integrity and validation
+
+This section ties together every check that stands between "wrote a byte"
+and "user restores a corrupted file three years later." Each piece is
+described in more depth elsewhere in this document (linked below); this is
+the map.
+
+1. **Preflight: is the destination even usable?** Before any inventorying
+   or tar-building, each backend confirms its destination is reachable
+   *and actually writable* — a real write-and-delete probe, not a
+   permissions-bit check — so a bad bucket/collection/mount fails in
+   seconds, not after hours of walking and hashing. See the **Preflight
+   checks** paragraph at the top of [Archive flow](#archive-flow) for the
+   per-backend mechanics (`probe_write_access()`, `operation_ls()`, etc.).
+
+2. **Source-of-truth checksum, computed once, before packing.**
+   `_checksum_one()` (`archive_common.py:81`) computes a SHA256 over every
+   regular file's contents (or a symlink's target string) as
+   `build_inventory()` walks the tree — this value is recorded in the
+   `files[]` inventory record and never recomputed from the original at
+   archive time again. It's the baseline everything downstream — both the
+   archive-time upload checks and any later restore-time re-verification —
+   is checked against.
+
+3. **Upload/transfer verification, per backend.** Every object is checked
+   immediately after it lands at the destination, before the run proceeds:
+   - **S3**: `upload_file_to_s3()` always verifies destination size via
+     `head_object`, and — when the endpoint supports it, per an up-front
+     `probe_checksum_support()` capability probe — additionally compares a
+     whole-object CRC64NVME checksum computed locally against the one S3
+     computed server-side during upload. See
+     [Upload checksum verification (S3)](#upload-checksum-verification-s3)
+     for why CRC64NVME rather than the SHA256 already sitting in the
+     inventory.
+   - **Globus**: transfer tasks run with `verify_checksum=True`/
+     `sync_level="checksum"` (on by default; `--no-verify-checksum-transfer`
+     disables it) — Globus's own server-side, end-to-end checksum
+     verification of the transfer itself, additive to the SHA256 already
+     recorded in the inventory.
+   - **Local**: `copy_file_to_local()` always compares destination size to
+     source after every `shutil.copy2`, and, when `--verify-checksum` is
+     passed, additionally re-hashes the destination with SHA256 and
+     compares it to the source's inventory checksum (or, for a tar object,
+     to a checksum computed from the freshly-built local tar just before
+     the copy).
+
+   A verification failure raises and aborts the run in all three
+   backends — it never continues with unconfirmed data. See the closing
+   paragraph of [Upload checksum verification (S3)](#upload-checksum-verification-s3)
+   for the S3 case specifically; the Globus and local paths propagate the
+   underlying `TransferAPIError`/mismatch the same way, uncaught.
+
+4. **Delete only after everything is verified.** `--delete` (all three
+   archive scripts) runs `shutil.rmtree()` on the source *only* after
+   every object has been uploaded/transferred and verified, and the
+   inventory itself has been written to disk and uploaded — see step 7 of
+   [Archive flow](#archive-flow). This ordering means a mid-run crash can
+   never produce a state where the source is gone but the archive isn't
+   fully intact: worst case is wasted space (orphaned objects with no
+   inventory pointing at them yet) or a redundant, still-intact source
+   sitting next to a complete, valid archive.
+
+5. **Independent re-verification at restore time.** `--verify-checksums`
+   (all three `restore_from_*.py` scripts) runs `verify_restored_files()`
+   (`archive_common.py:435`) after restore completes: it re-hashes every
+   restored file (or symlink target) from disk and compares it to the
+   SHA256 recorded in the inventory at archive time, raising on any
+   `missing` or `checksum_mismatch`. This is the one check that verifies
+   the *entire* chain end-to-end — archive-time read, upload, storage,
+   download, and extraction all have to have gone right for it to pass —
+   independent of whatever backend-specific verification already happened
+   at archive time. See step 7 of [Restore flow](#restore-flow).
+
+Together, (2)+(3) guard the archive-time path (did the bytes that left
+this machine arrive intact), and (5) guards the restore-time path (did the
+bytes that come back match what was originally read). The two are
+independent checks — passing one doesn't imply the other — which is why
+`--verify-checksums` on restore still has value even for a backend (like
+Globus) that already verifies its transfers server-side: it also catches
+corruption from extraction, filesystem, or storage-at-rest issues that
+transfer-level verification can't see.
+
 ## `--verbose` configuration listing
 
 `archive_common.print_config(verbose, label, settings)` prints a sorted

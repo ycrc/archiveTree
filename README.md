@@ -29,6 +29,48 @@ backend differences), see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
+## Data integrity
+
+Every step of an archive run is built to fail loudly rather than silently
+lose or corrupt data:
+
+- **Destination checked before any work starts.** Each backend probes that
+  the destination is actually reachable and writable — a real write probe,
+  not just a permissions check — before spending any time walking or
+  hashing the source tree, so a bad bucket/collection/mount fails in
+  seconds, not after hours of work.
+- **Every file is checksummed at the source.** While walking the tree,
+  archiveTree computes a SHA256 of each file's contents (or, for a
+  symlink, its target string) and records it in the inventory *before*
+  anything is packed or transferred — this becomes the permanent baseline
+  everything downstream is checked against.
+- **Every upload/transfer is verified**, using whichever mechanism the
+  backend actually supports: S3 compares a whole-object checksum computed
+  on both ends (falling back to a size check if the endpoint can't do
+  that); Globus verifies the transfer server-side by default; the local
+  backend always checks destination size and can optionally re-hash and
+  compare. A verification failure aborts the run rather than continuing
+  with unconfirmed data.
+- **The source is only deleted once everything else has succeeded.**
+  `--delete` removes the original directory tree only after every object
+  is uploaded and verified and the inventory itself is safely written and
+  stored — so a crash mid-archive can, at worst, leave some wasted space
+  behind, never a deleted source with no usable copy.
+- **Restores can be independently re-verified.** `--verify-checksums` on
+  any restore re-hashes every restored file and compares it to the
+  checksum recorded at archive time, catching corruption anywhere between
+  the original archive and the restored copy — including issues the
+  archive-time upload check couldn't have seen (extraction bugs, storage
+  bit-rot, and the like).
+
+For the exact mechanics behind each of these — which function does what,
+and why S3 needs a different checksum algorithm than the other two
+backends — see
+[Data integrity and validation](ARCHITECTURE.md#data-integrity-and-validation)
+in ARCHITECTURE.md.
+
+---
+
 ## Getting started
 
 This is the fast path: create a config file, archive a directory, browse
