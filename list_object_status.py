@@ -25,6 +25,7 @@ import argparse
 import os
 import sys
 
+import archive_config
 from archive_common import check_inventory_version, load_inventory_file, vprint
 
 # Reuse the restore script's own classification logic rather than keeping a
@@ -53,6 +54,13 @@ def main():
         "--endpoint-url",
         default=None,
         help="Custom S3 endpoint URL (for S3-compatible storage).",
+    )
+    parser.add_argument(
+        "--config-file", default=None,
+        help=(
+            "Path to config file with an [s3] section supplying defaults "
+            f"for profile/endpoint_url (default: {archive_config.DEFAULT_CONFIG_FILE})."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -94,15 +102,25 @@ def main():
         print("ERROR: 'archive' section is missing 's3_bucket' or 'objects'.", file=sys.stderr)
         sys.exit(1)
 
-    s3_client = get_s3_client(profile=args.profile, endpoint_url=args.endpoint_url)
+    # Honour ~/.archive.cfg's [s3] section the same way archive.py/restore.py
+    # do. Without this the tool silently falls back to the default AWS profile,
+    # which may point at a different account than the one holding the archive.
+    config_path = os.path.expanduser(args.config_file or archive_config.DEFAULT_CONFIG_FILE)
+    s3_config = archive_config.load_config_file(config_path, section="s3")
+    profile = args.profile or s3_config.get("profile")
+    endpoint_url = args.endpoint_url or s3_config.get("endpoint_url")
+
+    vprint(verbose, f"Using AWS profile: {profile or '(default credential chain)'}")
+
+    s3_client = get_s3_client(profile=profile, endpoint_url=endpoint_url)
 
     print(f"Inventory: {inv_path}")
     print(f"S3 bucket: {bucket}")
     print(f"Total objects in archive: {len(objects)}\n")
 
     # Header
-    print("object_id  type   storage_class  status      key")
-    print("---------  -----  -------------  ----------  ---")
+    print("object_id  type   storage_class  status                key")
+    print("---------  -----  -------------  --------------------  ---")
 
     for obj in objects:
         oid = obj.get("id", "?")
@@ -119,6 +137,7 @@ def main():
                 "storage_class": sc,
                 "restore_header": hdr,
                 "error": err,
+                "error_code": "no-key",
             }
         else:
             st = classify_object_status(bucket, key, s3_client, verbose=verbose)
@@ -133,9 +152,13 @@ def main():
 
         key_display = key if key is not None else "MISSING_KEY"
         sc_display = sc if sc is not None else "?"
-        status_display = status
 
-        print(f"{oid:9}  {otype:5}  {sc_display:13}  {status_display:10}  {key_display}")
+        # Surface the S3 code (AccessDenied, NoSuchKey, 403, ...) in the status
+        # column so the default output is diagnostic without --verbose.
+        code = st.get("error_code")
+        status_display = f"{status}({code})" if status == "error" and code else status
+
+        print(f"{oid:9}  {otype:5}  {sc_display:13}  {status_display:20}  {key_display}")
 
         if hdr and verbose:
             print(f"    Restore header: {hdr}")

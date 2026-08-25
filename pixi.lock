@@ -10,6 +10,8 @@ environments:
   default:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
     packages:
       linux-64:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -73,6 +75,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/typing_extensions-4.16.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026c-h151e31d_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/urllib3-2.7.0-pyhd8ed1ab_0.conda
+      - pypi: ./
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   build_number: 20
@@ -85,6 +88,7 @@ packages:
   - openmp_impl <0.0a0
   license: BSD-3-Clause
   license_family: BSD
+  purls: []
   run_exports:
     strong:
     - _openmp_mutex >=4.5
@@ -103,6 +107,7 @@ packages:
   - aws-c-cal >=0.9.15,<0.9.16.0a0
   license: Apache-2.0
   license_family: APACHE
+  purls: []
   run_exports:
     weak:
     - aws-c-auth >=0.10.4,<0.10.5.0a0
@@ -118,6 +123,7 @@ packages:
   - openssl >=3.5.7,<4.0a0
   license: Apache-2.0
   license_family: Apache
+  purls: []
   run_exports:
     weak:
     - aws-c-cal >=0.9.15,<0.9.16.0a0
@@ -131,6 +137,7 @@ packages:
   - libgcc >=14
   license: Apache-2.0
   license_family: Apache
+  purls: []
   run_exports:
     weak:
     - aws-c-common >=0.14.3,<0.14.4.0a0
@@ -145,6 +152,7 @@ packages:
   - aws-c-common >=0.14.3,<0.14.4.0a0
   license: Apache-2.0
   license_family: APACHE
+  purls: []
   run_exports:
     weak:
     - aws-c-compression >=0.3.2,<0.3.3.0a0
@@ -162,6 +170,7 @@ packages:
   - aws-checksums >=0.2.10,<0.2.11.0a0
   license: Apache-2.0
   license_family: APACHE
+  purls: []
   run_exports:
     weak:
     - aws-c-event-stream >=0.7.1,<0.7.2.0a0
@@ -179,6 +188,7 @@ packages:
   - aws-c-compression >=0.3.2,<0.3.3.0a0
   license: Apache-2.0
   license_family: APACHE
+  purls: []
   run_exports:
     weak:
     - aws-c-http >=0.11.0,<0.11.1.0a0
@@ -195,6 +205,7 @@ packages:
   - s2n >=1.7.6,<1.7.7.0a0
   license: Apache-2.0
   license_family: APACHE
+  purls: []
   run_exports:
     weak:
     - aws-c-io >=0.27.5,<0.27.6.0a0
@@ -211,6 +222,7 @@ packages:
   - aws-c-io >=0.27.5,<0.27.6.0a0
   license: Apache-2.0
   license_family: APACHE
+  purls: []
   run_exports:
     weak:
     - aws-c-mqtt >=0.16.0,<0.16.1.0a0
@@ -231,6 +243,7 @@ packages:
   - aws-c-cal >=0.9.15,<0.9.16.0a0
   license: Apache-2.0
   license_family: APACHE
+  purls: []
   run_exports:
     weak:
     - aws-c-s3 >=0.13.1,<0.13.2.0a0
@@ -245,6 +258,7 @@ packages:
   - aws-c-common >=0.14.3,<0.14.4.0a0
   license: Apache-2.0
   license_family: APACHE
+  purls: []
   run_exports:
     weak:
     - aws-c-sdkutils >=0.2.7,<0.2.8.0a0
@@ -259,6 +273,7 @@ packages:
   - aws-c-common >=0.14.3,<0.14.4.0a0
   license: Apache-2.0
   license_family: APACHE
+  purls: []
   run_exports:
     weak:
     - aws-checksums >=0.2.10,<0.2.11.0a0
@@ -284,6 +299,8 @@ packages:
   - aws-c-event-stream >=0.7.1,<0.7.2.0a0
   license: Apache-2.0
   license_family: APACHE
+  purls:
+  - pkg:pypi/awscrt?source=hash-mapping
   run_exports: {}
   size: 293778
   timestamp: 1786602536113
@@ -297,6 +314,8 @@ packages:
   - python_abi 3.12.* *_cp312
   - zstd >=1.5.7,<1.6.0a0
   license: BSD-3-Clause AND MIT AND EPL-2.0
+  purls:
+  - pkg:pypi/backports-zstd?source=hash-mapping
   run_exports: {}
   size: 240967
   timestamp: 1786861419155
@@ -313,6 +332,8 @@ packages:
   - libbrotlicommon 1.2.0 h39a168f_3
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/brotli?source=compressed-mapping
   run_exports: {}
   size: 367032
   timestamp: 1786622975850
@@ -324,6 +345,7 @@ packages:
   - libgcc >=14
   license: bzip2-1.0.6
   license_family: BSD
+  purls: []
   run_exports:
     weak:
     - bzip2 >=1.0.8,<2.0a0
@@ -341,6 +363,8 @@ packages:
   - python_abi 3.12.* *_cp312
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/cffi?source=hash-mapping
   run_exports: {}
   size: 302100
   timestamp: 1786775110054
@@ -358,6 +382,8 @@ packages:
   - __glibc >=2.17
   license: Apache-2.0 AND BSD-3-Clause AND PSF-2.0 AND MIT
   license_family: BSD
+  purls:
+  - pkg:pypi/cryptography?source=hash-mapping
   run_exports: {}
   size: 1895335
   timestamp: 1785640927244
@@ -370,6 +396,7 @@ packages:
   - libgcc >=14
   license: MIT
   license_family: MIT
+  purls: []
   run_exports:
     weak:
     - icu >=78.3,<79.0a0
@@ -385,6 +412,7 @@ packages:
   - binutils_impl_linux-64 2.46.1
   license: GPL-3.0-only
   license_family: GPL
+  purls: []
   run_exports: {}
   size: 745303
   timestamp: 1784214507189
@@ -398,6 +426,7 @@ packages:
   - expat 2.8.1.*
   license: MIT
   license_family: MIT
+  purls: []
   run_exports: {}
   size: 77856
   timestamp: 1781203599810
@@ -409,6 +438,7 @@ packages:
   - libgcc >=14
   license: MIT
   license_family: MIT
+  purls: []
   run_exports:
     weak:
     - libffi >=3.7.0,<3.8.0a0
@@ -425,6 +455,7 @@ packages:
   - libgcc-ng ==16.1.0=*_1
   license: GPL-3.0-only WITH GCC-exception-3.1
   license_family: GPL
+  purls: []
   run_exports: {}
   size: 1057877
   timestamp: 1785375436766
@@ -435,6 +466,7 @@ packages:
   - __glibc >=2.17,<3.0.a0
   license: GPL-3.0-only WITH GCC-exception-3.1
   license_family: GPL
+  purls: []
   run_exports:
     strong:
     - _openmp_mutex >=4.5
@@ -449,6 +481,7 @@ packages:
   constrains:
   - xz 5.8.3.*
   license: 0BSD
+  purls: []
   run_exports:
     weak:
     - liblzma >=5.8.3,<6.0a0
@@ -462,6 +495,7 @@ packages:
   - libgcc >=13
   license: LGPL-2.1-only
   license_family: GPL
+  purls: []
   run_exports:
     weak:
     - libnsl >=2.0.1,<2.1.0a0
@@ -476,6 +510,7 @@ packages:
   - libgcc >=15
   - libzlib >=1.3.2,<2.0a0
   license: blessing
+  purls: []
   run_exports:
     weak:
     - libsqlite >=3.53.4,<4.0a0
@@ -491,6 +526,7 @@ packages:
   - libstdcxx-ng ==16.1.0=*_1
   license: GPL-3.0-only WITH GCC-exception-3.1
   license_family: GPL
+  purls: []
   run_exports: {}
   size: 6631744
   timestamp: 1785375462643
@@ -502,6 +538,7 @@ packages:
   - __glibc >=2.17,<3.0.a0
   license: BSD-3-Clause
   license_family: BSD
+  purls: []
   run_exports:
     weak:
     - libuuid >=2.42.2,<3.0a0
@@ -514,6 +551,7 @@ packages:
   - libgcc >=14
   - __glibc >=2.17,<3.0.a0
   license: LGPL-2.1-or-later
+  purls: []
   run_exports:
     weak:
     - libxcrypt >=4.4.38
@@ -528,6 +566,7 @@ packages:
   - zlib 1.3.2 *_3
   license: Zlib
   license_family: Other
+  purls: []
   run_exports:
     weak:
     - libzlib >=1.3.2,<2.0a0
@@ -540,6 +579,7 @@ packages:
   - __glibc >=2.17,<3.0.a0
   - libgcc >=14
   license: X11 AND BSD-3-Clause
+  purls: []
   run_exports:
     weak:
     - ncurses >=6.6,<7.0a0
@@ -554,6 +594,7 @@ packages:
   - libgcc >=14
   license: Apache-2.0
   license_family: Apache
+  purls: []
   run_exports:
     weak:
     - openssl >=3.6.3,<4.0a0
@@ -584,6 +625,7 @@ packages:
   constrains:
   - python_abi 3.12.* *_cp312
   license: Python-2.0
+  purls: []
   run_exports:
     weak:
     - python_abi 3.12.* *_cp312
@@ -600,6 +642,7 @@ packages:
   - ncurses >=6.6,<7.0a0
   license: GPL-3.0-only
   license_family: GPL
+  purls: []
   run_exports:
     weak:
     - readline >=8.3,<9.0a0
@@ -614,6 +657,7 @@ packages:
   - openssl >=3.5.7,<4.0a0
   license: Apache-2.0
   license_family: Apache
+  purls: []
   run_exports:
     weak:
     - s2n >=1.7.6,<1.7.7.0a0
@@ -630,6 +674,7 @@ packages:
   constrains:
   - xorg-libx11 >=1.8.13,<2.0a0
   license: TCL
+  purls: []
   run_exports:
     weak:
     - tk >=8.6.13,<8.7.0a0
@@ -643,6 +688,7 @@ packages:
   - libzlib >=1.3.2,<2.0a0
   license: BSD-3-Clause
   license_family: BSD
+  purls: []
   run_exports:
     weak:
     - zstd >=1.5.7,<1.6.0a0
@@ -658,6 +704,8 @@ packages:
   - s3transfer >=0.19.0,<0.20.0
   license: Apache-2.0
   license_family: Apache
+  purls:
+  - pkg:pypi/boto3?source=compressed-mapping
   run_exports: {}
   size: 88792
   timestamp: 1787075619762
@@ -671,6 +719,8 @@ packages:
   - urllib3 >=1.25.4,!=2.2.0,<3
   license: Apache-2.0
   license_family: Apache
+  purls:
+  - pkg:pypi/botocore?source=hash-mapping
   run_exports: {}
   size: 8985840
   timestamp: 1787061101059
@@ -680,6 +730,7 @@ packages:
   depends:
   - __unix
   license: ISC
+  purls: []
   run_exports: {}
   size: 131780
   timestamp: 1784754889428
@@ -689,6 +740,8 @@ packages:
   depends:
   - python >=3.10
   license: ISC
+  purls:
+  - pkg:pypi/certifi?source=hash-mapping
   run_exports: {}
   size: 137015
   timestamp: 1784717699092
@@ -699,6 +752,8 @@ packages:
   - python >=3.10
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/charset-normalizer?source=compressed-mapping
   run_exports: {}
   size: 64487
   timestamp: 1786835648298
@@ -714,6 +769,8 @@ packages:
   - python
   license: Apache-2.0
   license_family: APACHE
+  purls:
+  - pkg:pypi/globus-sdk?source=hash-mapping
   run_exports: {}
   size: 268471
   timestamp: 1786427803784
@@ -727,6 +784,8 @@ packages:
   - python
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/h2?source=hash-mapping
   run_exports: {}
   size: 100789
   timestamp: 1785796355216
@@ -737,6 +796,8 @@ packages:
   - python >=3.10
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/hpack?source=hash-mapping
   run_exports: {}
   size: 32884
   timestamp: 1782283986153
@@ -747,6 +808,8 @@ packages:
   - python >=3.9
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/hyperframe?source=hash-mapping
   run_exports: {}
   size: 17397
   timestamp: 1737618427549
@@ -758,6 +821,8 @@ packages:
   - python
   license: BSD-3-Clause
   license_family: BSD
+  purls:
+  - pkg:pypi/idna?source=compressed-mapping
   run_exports: {}
   size: 177433
   timestamp: 1787059857580
@@ -769,6 +834,8 @@ packages:
   - python
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/jmespath?source=hash-mapping
   run_exports: {}
   size: 25946
   timestamp: 1769161799923
@@ -780,6 +847,8 @@ packages:
   - python
   license: BSD-3-Clause
   license_family: BSD
+  purls:
+  - pkg:pypi/pycparser?source=hash-mapping
   run_exports: {}
   size: 55886
   timestamp: 1779293633166
@@ -794,6 +863,8 @@ packages:
   - cryptography >=3.4.0
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/pyjwt?source=hash-mapping
   run_exports: {}
   size: 33417
   timestamp: 1779400286454
@@ -805,6 +876,8 @@ packages:
   - python >=3.9
   license: BSD-3-Clause
   license_family: BSD
+  purls:
+  - pkg:pypi/pysocks?source=hash-mapping
   run_exports: {}
   size: 21085
   timestamp: 1733217331982
@@ -817,6 +890,8 @@ packages:
   - python
   license: Apache-2.0
   license_family: APACHE
+  purls:
+  - pkg:pypi/python-dateutil?source=hash-mapping
   run_exports: {}
   size: 233310
   timestamp: 1751104122689
@@ -828,6 +903,7 @@ packages:
   - python 3.12.* *_cpython
   license: BSD-3-Clause
   license_family: BSD
+  purls: []
   run_exports: {}
   size: 6958
   timestamp: 1752805918820
@@ -845,6 +921,8 @@ packages:
   - chardet >=3.0.2,<8
   license: Apache-2.0
   license_family: APACHE
+  purls:
+  - pkg:pypi/requests?source=hash-mapping
   run_exports: {}
   size: 68709
   timestamp: 1778851103479
@@ -856,6 +934,8 @@ packages:
   - python >=3.10
   license: Apache-2.0
   license_family: Apache
+  purls:
+  - pkg:pypi/s3transfer?source=hash-mapping
   run_exports: {}
   size: 73914
   timestamp: 1784820701090
@@ -867,6 +947,8 @@ packages:
   - python
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/six?source=hash-mapping
   run_exports: {}
   size: 18455
   timestamp: 1753199211006
@@ -881,6 +963,8 @@ packages:
   - envwrap >=0.2
   - ipywidgets >=6.0
   license: MPL-2.0 and MIT
+  purls:
+  - pkg:pypi/tqdm?source=hash-mapping
   run_exports: {}
   size: 98184
   timestamp: 1785172528905
@@ -892,6 +976,8 @@ packages:
   - python
   license: PSF-2.0
   license_family: PSF
+  purls:
+  - pkg:pypi/typing-extensions?source=hash-mapping
   run_exports: {}
   size: 52631
   timestamp: 1783002732887
@@ -899,6 +985,7 @@ packages:
   sha256: b928c30ddcb0e3f544c6eade8352737e6e610e263276b90232db6a578ef899d8
   md5: fcb489df604d100968b737f2cb6076c6
   license: LicenseRef-Public-Domain
+  purls: []
   run_exports: {}
   size: 118849
   timestamp: 1784250406640
@@ -913,6 +1000,15 @@ packages:
   - python >=3.10
   license: MIT
   license_family: MIT
+  purls:
+  - pkg:pypi/urllib3?source=hash-mapping
   run_exports: {}
   size: 103560
   timestamp: 1778188657149
+- pypi: ./
+  name: archivetree
+  requires_dist:
+  - boto3>=1.26.163
+  - globus-sdk>=3.41,<5
+  - tqdm>=4.64.1
+  requires_python: '>=3.9'

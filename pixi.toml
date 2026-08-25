@@ -9,6 +9,8 @@ version = "0.6.0"
 archive = "python archive.py"
 restore = "python restore.py"
 browse = "python browse_inventory.py"
+list-object-status = "python list_object_status.py"
+status = "python list_object_status.py"   # short alias
 
 # Install archiveTree itself into the environment (editable, so edits to the
 # .py files here take effect without reinstalling). This is what puts the

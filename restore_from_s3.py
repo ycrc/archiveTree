@@ -114,6 +114,33 @@ class DownloadProgressCallback:
 
 # ---------- Glacier / Deep Archive Helpers ----------
 
+def decode_head_403(bucket, key, s3_client, verbose=False):
+    """
+    Recover the real error code behind a bare 403 from head_object.
+
+    HeadObject is an HTTP HEAD request, so S3 returns no response body and
+    botocore has nothing to parse a code out of -- AccessDenied, NoSuchKey and
+    a KMS decrypt denial all surface identically as "(403) Forbidden". A
+    one-byte ranged GET hits the same object but does return an XML error
+    body, so the underlying code and message become visible.
+
+    Returns (code, message), either of which may be None if the probe could
+    not name the cause.
+    """
+    try:
+        s3_client.get_object(Bucket=bucket, Key=key, Range="bytes=0-0")
+    except ClientError as e:
+        err = e.response.get("Error", {})
+        code = err.get("Code") or None
+        vprint(verbose, f"s3://{bucket}/{key}: GetObject probe reports {code}")
+        return code, err.get("Message") or None
+    except Exception as e:  # noqa: BLE001 - probe must never mask the original
+        vprint(verbose, f"s3://{bucket}/{key}: GetObject probe failed: {e}")
+        return None, None
+    # GET succeeded where HEAD failed; nothing further to report.
+    return None, None
+
+
 def classify_object_status(bucket, key, s3_client, verbose=False):
     """
     Inspect a single S3 object and classify its availability.
@@ -124,18 +151,38 @@ def classify_object_status(bucket, key, s3_client, verbose=False):
         "storage_class": str or None,
         "restore_header": str or None,
         "error": str or None,
+        "error_code": str or None,   # S3 code (or HTTP status) when status is "error"
       }
     """
     try:
         resp = s3_client.head_object(Bucket=bucket, Key=key)
     except ClientError as e:
+        meta = e.response.get("ResponseMetadata", {})
+        http_status = meta.get("HTTPStatusCode")
+        code = e.response.get("Error", {}).get("Code") or None
         msg = f"head_object failed: {e}"
+
+        # A 403 from HEAD carries no body, so re-probe with GET to find out
+        # whether this is really AccessDenied, a missing key, or a KMS denial.
+        if http_status == 403:
+            real_code, real_msg = decode_head_403(
+                bucket, key, s3_client, verbose=verbose
+            )
+            if real_code:
+                code = real_code
+                msg = f"{msg} [GetObject reports {real_code}: {real_msg}]"
+
+        # Fall back to the bare HTTP status when no code could be named.
+        if not code or code == str(http_status):
+            code = str(http_status) if http_status else None
+
         vprint(verbose, f"s3://{bucket}/{key}: ERROR {msg}")
         return {
             "status": "error",
             "storage_class": None,
             "restore_header": None,
             "error": msg,
+            "error_code": code,
         }
 
     storage_class = resp.get("StorageClass", "STANDARD")
@@ -149,6 +196,7 @@ def classify_object_status(bucket, key, s3_client, verbose=False):
             "storage_class": storage_class,
             "restore_header": restore_hdr,
             "error": None,
+            "error_code": None,
         }
 
     # In Glacier / Deep Archive class
@@ -163,6 +211,7 @@ def classify_object_status(bucket, key, s3_client, verbose=False):
             "storage_class": storage_class,
             "restore_header": restore_hdr,
             "error": None,
+            "error_code": None,
         }
 
     if restore_hdr and 'ongoing-request="true"' in restore_hdr:
@@ -174,6 +223,7 @@ def classify_object_status(bucket, key, s3_client, verbose=False):
             "storage_class": storage_class,
             "restore_header": restore_hdr,
             "error": None,
+            "error_code": None,
         }
 
     # Cold, no restore requested yet
@@ -183,6 +233,7 @@ def classify_object_status(bucket, key, s3_client, verbose=False):
         "storage_class": storage_class,
         "restore_header": restore_hdr,
         "error": None,
+        "error_code": None,
     }
 
 
