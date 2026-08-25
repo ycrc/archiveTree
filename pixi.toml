@@ -10,6 +10,14 @@ archive = "python archive.py"
 restore = "python restore.py"
 browse = "python browse_inventory.py"
 
+# Install archiveTree itself into the environment (editable, so edits to the
+# .py files here take effect without reinstalling). This is what puts the
+# console scripts declared in pyproject.toml's [project.scripts] -- archive,
+# restore, archive-to-s3, browse-inventory, etc. -- on PATH inside
+# `pixi shell`, so they can be run by name rather than via `pixi run`.
+[pypi-dependencies]
+archiveTree = { path = ".", editable = true }
+
 [dependencies]
 # Pinned to exclude conda-forge's free-threaded ("nogil"/cp3XXt) build:
 # without this, the solver can pick a freethreading build, and every run
