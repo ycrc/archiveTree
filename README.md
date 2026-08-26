@@ -90,31 +90,80 @@ already manage Python.
 
 ### Prerequisites (once per user)
 
+> **Read this section even if you already use GitHub over SSH.** `uv` and
+> `pip` run `git` in a subprocess with no controlling terminal, so ssh
+> cannot ask you anything. A setup that works fine when you type `git pull`
+> by hand can still hang the installer forever. The requirements below are
+> what make the install work *without any prompting*.
+
 **1. Read access.** Your GitHub account needs read access to
-`ycrc/archiveTree`. Ask a YCRC admin if `git ls-remote
-git@github.com:ycrc/archiveTree.git` fails with a permissions error.
+`ycrc/archiveTree`. Ask a YCRC admin if the verification command at the end
+of this section fails with a permissions error.
 
-**2. An SSH key registered with GitHub**, and — if the `ycrc` organization
-enforces SAML single sign-on — that key must also be *authorized for the
-organization*: GitHub → Settings → SSH and GPG keys → **Configure SSO**
-next to the key → Authorize. Skipping this step produces a generic
-permission-denied error that does not mention SSO, so check it first if
-access fails.
+**2. An SSH key that can be used without a passphrase prompt.** This is the
+one that catches people. If you have no GitHub key on this machine yet,
+create one with no passphrase:
 
-**3. GitHub's host key in `known_hosts`.** Installers run `git` with
-terminal prompts disabled, so if you have never connected to GitHub over
-SSH from this machine the install aborts with `Host key verification
-failed` rather than offering to accept the fingerprint:
+```bash
+ssh-keygen -t ed25519 -C "$USER@$(hostname -s)-github" -f ~/.ssh/id_ed25519_github -N ""
+cat ~/.ssh/id_ed25519_github.pub
+```
+
+Add that public key at GitHub → Settings → SSH and GPG keys → **New SSH
+key**.
+
+If you would rather use an existing passphrase-protected key, you must load
+it into an agent *in the shell you install from*, otherwise the install
+hangs (see [Troubleshooting](#troubleshooting-the-install) below):
+
+```bash
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/your_key       # type the passphrase once
+```
+
+**3. SAML SSO authorization.** If the `ycrc` organization enforces single
+sign-on, the key must additionally be *authorized for the organization*:
+GitHub → Settings → SSH and GPG keys → **Configure SSO** next to the key →
+Authorize. Skipping this produces a generic permission-denied error that
+never mentions SSO, so check it first if access fails.
+
+**4. An `~/.ssh/config` entry.** Recommended, and necessary if you have
+several keys — ssh offers them one at a time and GitHub drops the
+connection after six failures, so a valid key further down the list may
+never be reached:
+
+```
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519_github
+    IdentitiesOnly yes
+```
+
+`User git` is not a placeholder — GitHub's SSH user is always the literal
+string `git`, never your GitHub username. `IdentitiesOnly yes` stops ssh
+from parading every key you own past the server.
+
+**5. GitHub's host key in `known_hosts`.** With prompts unavailable, an
+unknown host key aborts the install with `Host key verification failed`
+instead of offering to accept the fingerprint:
 
 ```bash
 ssh-keyscan github.com >> ~/.ssh/known_hosts
 ```
 
-Verify all three at once — this should print a list of refs:
+### Verify before installing
+
+Run this *exact* command. `BatchMode=yes` forbids ssh from prompting for
+anything, which is precisely the constraint the installer runs under — so
+if this succeeds, the install will work:
 
 ```bash
-git ls-remote git@github.com:ycrc/archiveTree.git
+GIT_SSH_COMMAND="ssh -o BatchMode=yes" git ls-remote git@github.com:ycrc/archiveTree.git
 ```
+
+It should print a list of refs including `refs/tags/0.7.0`. Do not proceed
+until it does; see below if it fails.
 
 ### uv (recommended)
 
@@ -205,6 +254,58 @@ $EDITOR ~/.archive.cfg
 
 If you already have a checkout (the pixi path above), just copy it from
 there instead.
+
+### Troubleshooting the install
+
+**`uv tool install` hangs at `Resolving dependencies...` and never
+finishes.** Almost always ssh waiting on a passphrase it cannot ask for.
+The installer runs `git` with no controlling terminal, so ssh falls back to
+`SSH_ASKPASS`; with `DISPLAY` set (X11 forwarding) it then blocks
+indefinitely on a helper that cannot render a prompt, instead of failing.
+Interrupt it and diagnose with the fail-fast form:
+
+```bash
+GIT_SSH_COMMAND="ssh -o BatchMode=yes" git ls-remote git@github.com:ycrc/archiveTree.git
+```
+
+`BatchMode=yes` turns the hang into an immediate error. Fix by loading the
+key into an agent in this shell (`eval "$(ssh-agent -s)"; ssh-add
+~/.ssh/your_key`) or by using a passphrase-free key, then reinstall. Note
+that `GIT_TERMINAL_PROMPT=0`, which uv sets, only suppresses *HTTPS*
+credential prompts — it does nothing about ssh.
+
+**`Permission denied (publickey)`, but verbose output says `Server accepts
+key`.** Run `ssh -v -o BatchMode=yes -T git@github.com`. If you see
+`Server accepts key:` followed immediately by `No more authentication
+methods to try`, GitHub recognised the key but ssh could not *sign* with
+it — the private key is passphrase-protected and nothing can unlock it.
+Same fix as above.
+
+**`Permission denied (publickey)` with no key offered at all.** Check that
+`~/.ssh/config` points `Host github.com` at the right `IdentityFile`, and
+that it says `User git`. Confirm the key is the one GitHub has by comparing
+`ssh-keygen -lf ~/.ssh/id_ed25519_github.pub` against the fingerprint shown
+under GitHub → Settings → SSH and GPG keys.
+
+**`ssh -T git@github.com` succeeds but `git ls-remote` is denied.** You
+authenticated, but cannot read this repository. Either you lack access to
+`ycrc/archiveTree`, or the key is not SSO-authorized for the organization
+(prerequisite 3 above).
+
+**`ls-remote` works but prints no `refs/tags/0.7.0`.** Auth is fine; that
+tag does not exist on the remote. Check the repository's tags page and
+substitute whichever tag is current.
+
+**Testing a key while an agent is loaded.** Add `-o IdentityAgent=none` to
+force ssh to use the key file rather than a cached agent identity —
+otherwise a stale agent key can make a broken configuration look healthy.
+
+**Stale state from an interrupted install.** Clear uv's cached checkout and
+retry:
+
+```bash
+uv cache clean archivetree
+```
 
 ---
 
