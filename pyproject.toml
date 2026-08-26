@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "archiveTree"
-version = "0.6.0"
+version = "0.7.0"
 description = "Archive directory trees to Amazon S3, a Globus collection, or a locally-mounted directory as size-grouped tar objects, and browse/restore from the resulting inventory."
 readme = "README.md"
 license = "MIT"

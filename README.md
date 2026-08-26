@@ -83,9 +83,38 @@ in ARCHITECTURE.md.
 
 ## Installation
 
-archiveTree is a set of command-line tools, so the recommended installs put
-it in its own isolated environment rather than into a shared one. Pick
-whichever of these matches how you already manage Python.
+**archiveTree is currently a private repository**, so every install below
+goes over SSH and requires GitHub access to the `ycrc` organization. Work
+through the prerequisites once, then pick whichever install matches how you
+already manage Python.
+
+### Prerequisites (once per user)
+
+**1. Read access.** Your GitHub account needs read access to
+`ycrc/archiveTree`. Ask a YCRC admin if `git ls-remote
+git@github.com:ycrc/archiveTree.git` fails with a permissions error.
+
+**2. An SSH key registered with GitHub**, and — if the `ycrc` organization
+enforces SAML single sign-on — that key must also be *authorized for the
+organization*: GitHub → Settings → SSH and GPG keys → **Configure SSO**
+next to the key → Authorize. Skipping this step produces a generic
+permission-denied error that does not mention SSO, so check it first if
+access fails.
+
+**3. GitHub's host key in `known_hosts`.** Installers run `git` with
+terminal prompts disabled, so if you have never connected to GitHub over
+SSH from this machine the install aborts with `Host key verification
+failed` rather than offering to accept the fingerprint:
+
+```bash
+ssh-keyscan github.com >> ~/.ssh/known_hosts
+```
+
+Verify all three at once — this should print a list of refs:
+
+```bash
+git ls-remote git@github.com:ycrc/archiveTree.git
+```
 
 ### uv (recommended)
 
@@ -93,7 +122,7 @@ whichever of these matches how you already manage Python.
 scripts on your `PATH` in a dedicated virtual environment:
 
 ```bash
-uv tool install "archiveTree[checksums] @ git+https://github.com/ycrc/archiveTree@v0.6.0"
+uv tool install "archiveTree[checksums] @ git+ssh://git@github.com/ycrc/archiveTree@0.7.0"
 ```
 
 ### pipx
@@ -101,7 +130,7 @@ uv tool install "archiveTree[checksums] @ git+https://github.com/ycrc/archiveTre
 Same isolation, if you already use pipx:
 
 ```bash
-pipx install "archiveTree[checksums] @ git+https://github.com/ycrc/archiveTree@v0.6.0"
+pipx install "archiveTree[checksums] @ git+ssh://git@github.com/ycrc/archiveTree@0.7.0"
 ```
 
 ### pip
@@ -111,7 +140,7 @@ environment; see the warning below.
 
 ```bash
 python3 -m venv ~/.venvs/archivetree
-~/.venvs/archivetree/bin/pip install "archiveTree[checksums] @ git+https://github.com/ycrc/archiveTree@v0.6.0"
+~/.venvs/archivetree/bin/pip install "archiveTree[checksums] @ git+ssh://git@github.com/ycrc/archiveTree@0.7.0"
 ```
 
 ### conda / mamba
@@ -123,7 +152,7 @@ archiveTree itself:
 ```bash
 conda create -n archivetree -c conda-forge python=3.12 boto3 "globus-sdk<5" tqdm awscrt
 conda activate archivetree
-pip install "archiveTree @ git+https://github.com/ycrc/archiveTree@v0.6.0"
+pip install "archiveTree @ git+ssh://git@github.com/ycrc/archiveTree@0.7.0"
 ```
 
 (Omit `[checksums]` on the pip line here — conda already provided `awscrt`.)
@@ -135,7 +164,7 @@ complete environment and installs the project in editable mode, so edits to
 the `.py` files take effect immediately:
 
 ```bash
-git clone https://github.com/ycrc/archiveTree
+git clone git@github.com:ycrc/archiveTree.git
 cd archiveTree
 pixi shell          # console scripts are now on PATH
 pixi run archive    # or run a task directly
@@ -164,11 +193,18 @@ you use the S3 backend with `--delete`.
 
 The [Getting started](#getting-started) steps below start by copying
 `archive.cfg.example`. That file lives in the source repository and is not
-installed by pip/uv, so fetch it directly:
+installed by pip/uv. Because the repository is private it cannot be fetched
+anonymously over HTTPS, so pull it out of a shallow clone:
 
 ```bash
-curl -O https://raw.githubusercontent.com/ycrc/archiveTree/main/archive.cfg.example
+git clone --depth 1 --branch 0.7.0 git@github.com:ycrc/archiveTree.git /tmp/archiveTree-src
+cp /tmp/archiveTree-src/archive.cfg.example ~/.archive.cfg
+rm -rf /tmp/archiveTree-src
+$EDITOR ~/.archive.cfg
 ```
+
+If you already have a checkout (the pixi path above), just copy it from
+there instead.
 
 ---
 
@@ -189,8 +225,7 @@ $EDITOR ~/.archive.cfg
 
 See [`archive.cfg.example`](archive.cfg.example) for every setting,
 inline-documented, and the [Configuration file](#configuration-file)
-section below for precedence rules. 
-all three now.)
+section below for precedence rules.
 
 **2. Archive a directory**, using the `archive` wrapper. The backend comes
 from `--backend`, or from `backend = ...` in the `[archive]` section of the

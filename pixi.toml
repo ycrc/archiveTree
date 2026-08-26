@@ -3,7 +3,7 @@ authors = ["Robert Bjornson <robert.bjornson@yale.edu>"]
 channels = ["conda-forge"]
 name = "archiveTree"
 platforms = ["linux-64"]
-version = "0.6.0"
+version = "0.7.0"
 
 [tasks]
 archive = "python archive.py"

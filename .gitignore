@@ -1,0 +1,26 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments (the pixi env dir writes its own .gitignore)
+.venv/
+venv/
+
+# Real config files. archive.cfg.example is the committed template; an
+# actual config holds S3 credentials and Globus collection details and must
+# never be committed.
+.archive.cfg
+archive.cfg
+*.cfg
+!archive.cfg.example
+
+# Generated per-archive artifacts: inventories written next to the source
+# tree, and the restore scripts browse-inventory writes.
+*.inventory.*.json.gz
+restore_*.sh
