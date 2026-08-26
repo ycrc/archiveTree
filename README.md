@@ -81,6 +81,97 @@ in ARCHITECTURE.md.
 
 ---
 
+## Installation
+
+archiveTree is a set of command-line tools, so the recommended installs put
+it in its own isolated environment rather than into a shared one. Pick
+whichever of these matches how you already manage Python.
+
+### uv (recommended)
+
+[`uv tool install`](https://docs.astral.sh/uv/) puts the ten console
+scripts on your `PATH` in a dedicated virtual environment:
+
+```bash
+uv tool install "archiveTree[checksums] @ git+https://github.com/ycrc/archiveTree@v0.6.0"
+```
+
+### pipx
+
+Same isolation, if you already use pipx:
+
+```bash
+pipx install "archiveTree[checksums] @ git+https://github.com/ycrc/archiveTree@v0.6.0"
+```
+
+### pip
+
+Works, but installs into whatever environment is active. Use a virtual
+environment; see the warning below.
+
+```bash
+python3 -m venv ~/.venvs/archivetree
+~/.venvs/archivetree/bin/pip install "archiveTree[checksums] @ git+https://github.com/ycrc/archiveTree@v0.6.0"
+```
+
+### conda / mamba
+
+There is no conda-forge package. Create an environment and install into it
+with pip — the conda packages supply the compiled dependencies, pip supplies
+archiveTree itself:
+
+```bash
+conda create -n archivetree -c conda-forge python=3.12 boto3 "globus-sdk<5" tqdm awscrt
+conda activate archivetree
+pip install "archiveTree @ git+https://github.com/ycrc/archiveTree@v0.6.0"
+```
+
+(Omit `[checksums]` on the pip line here — conda already provided `awscrt`.)
+
+### pixi (development)
+
+For hacking on archiveTree itself, `pixi.toml` in this repo defines a
+complete environment and installs the project in editable mode, so edits to
+the `.py` files take effect immediately:
+
+```bash
+git clone https://github.com/ycrc/archiveTree
+cd archiveTree
+pixi shell          # console scripts are now on PATH
+pixi run archive    # or run a task directly
+```
+
+### The `[checksums]` extra
+
+`awscrt` is optional and ships as a compiled wheel, so it is not installed
+by default. Adding `[checksums]` pulls it in and enables local CRC64NVME
+computation, which lets `archive_to_s3.py` verify uploads against S3's
+whole-object checksums before deleting source files, and lets the S3 restore
+path re-check downloads against the inventory. Without it, archiveTree
+falls back to size-only verification and prints a warning. Recommended if
+you use the S3 backend with `--delete`.
+
+> **A note on shared environments.** archiveTree currently installs its
+> modules at the top level of `site-packages` under generic names —
+> including `archive`, `restore`, `archive_config`, and `globus_config`.
+> In an environment shared with other packages these names can collide, and
+> a file named `archive.py` in your working directory will shadow
+> archiveTree's. The isolated installs above (`uv tool`, `pipx`, a dedicated
+> venv or conda env) avoid this entirely; prefer them over installing into a
+> general-purpose environment.
+
+### Getting an example config
+
+The [Getting started](#getting-started) steps below start by copying
+`archive.cfg.example`. That file lives in the source repository and is not
+installed by pip/uv, so fetch it directly:
+
+```bash
+curl -O https://raw.githubusercontent.com/ycrc/archiveTree/main/archive.cfg.example
+```
+
+---
+
 ## Getting started
 
 This is the fast path: create a config file, archive a directory, browse
@@ -147,19 +238,33 @@ restore mydata.inventory.<archive_id>.json.gz
 
 ## Requirements
 
-- Python 3.9+
-- `boto3` (for the S3 tools)
-- `globus-sdk` (for the Globus tools)
-- `tqdm` (optional; enables progress bars with `--verbose`)
-- `awscrt` (optional; lets `archive_to_s3.py` verify uploads with S3's
+- Python 3.10+
+
+The [Installation](#installation) steps above handle everything below
+automatically; this section is for reference, or for running the scripts
+straight from a checkout without installing.
+
+Installed by default:
+
+- `boto3>=1.43` (for the S3 tools)
+- `globus-sdk>=3.41,<5` (for the Globus tools; both the 3.x and 4.x lines
+  are supported, and archiveTree adapts to the differences at runtime)
+- `tqdm>=4.70` (enables progress bars with `--verbose`; every import site
+  degrades gracefully to plain progress messages if it is absent, so
+  `--no-deps` installs still work)
+
+Optional, via the `[checksums]` extra:
+
+- `awscrt>=0.23` (lets `archive_to_s3.py` verify uploads with S3's
   whole-object CRC64NVME checksum instead of falling back to size-only
   verification — see `--no-checksum-verify` below)
 
 The local backend (`archive_to_local.py` / `restore_from_local.py`) needs
-none of the above beyond the Python standard library — it never imports
-`boto3` or `globus_sdk`, so it works in any environment (and is a
-convenient way to exercise most of this tool's logic without cloud
-credentials at all).
+nothing beyond the Python standard library — it never imports `boto3` or
+`globus_sdk`, so it works in any environment (and is a convenient way to
+exercise most of this tool's logic without cloud credentials at all). The
+two are installed unconditionally only to keep installation simple; if you
+want a truly minimal local-only install, use `--no-deps`.
 
 **`--verbose` on every `archive_to_*.py`/`restore_from_*.py` script (and
 `archive`/`restore`, which forward it through)** prints a `Configuration:`

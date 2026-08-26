@@ -1,21 +1,69 @@
 [build-system]
-requires = ["setuptools>=61"]
+# setuptools>=77 is required for PEP 639 SPDX `license` / `license-files`.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "archiveTree"
-version = "0.4"
+version = "0.6.0"
 description = "Archive directory trees to Amazon S3, a Globus collection, or a locally-mounted directory as size-grouped tar objects, and browse/restore from the resulting inventory."
 readme = "README.md"
-requires-python = ">=3.9"
-dependencies = [
-    "boto3>=1.26.163",
-    "globus-sdk>=3.41,<5",
-    "tqdm>=4.64.1",
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Robert Bjornson", email = "robert.bjornson@yale.edu" },
 ]
+# The code is written to a 3.9-compatible subset, but 3.9 is not exercised
+# anywhere: the EasyBuild module builds against Python 3.10.8 and the pixi
+# environment pins 3.12. Claim only what is actually tested.
+requires-python = ">=3.10"
+keywords = ["archive", "backup", "s3", "globus", "hpc", "tar", "glacier"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Archiving :: Backup",
+]
+
+dependencies = [
+    # archive_to_s3.py / restore_from_s3.py / list_object_status.py.
+    "boto3>=1.43",
+
+    # archive_to_globus.py / restore_from_globus.py / globus_auth.py /
+    # globus_transfer.py. Both the 3.x and 4.x lines are supported and in
+    # active use: the EasyBuild module gets 3.44 (via Globus-CLI), the pixi
+    # environment resolves 4.x. globus_transfer.new_transfer() adapts to
+    # TransferData's signature change between them at runtime. Capped below
+    # 5, which is unreleased and unverified.
+    "globus-sdk>=3.41,<5",
+
+    # Every import site guards tqdm with try/except ImportError and falls
+    # back to plain progress messages, so it is technically optional. It is
+    # declared as a hard dependency anyway: it is pure Python, tiny, and the
+    # progress bars during inventory/tar/transfer/upload/download are what
+    # users expect. Install with --no-deps to omit it.
+    "tqdm>=4.70",
+]
+
+[project.optional-dependencies]
+# Genuinely optional, and a compiled wheel, so it is kept out of the default
+# install. archive_to_s3.py falls back to size-only upload verification if it
+# is absent (with a warning). Installing it lets archiveTree compute
+# CRC64NVME checksums locally and verify uploads against S3's whole-object
+# checksums before deleting source files, and lets the S3 restore path
+# re-check downloaded objects against the checksum recorded in the inventory.
+checksums = ["awscrt>=0.23"]
+all = ["archiveTree[checksums]"]
 
 [project.urls]
 Homepage = "https://github.com/ycrc/archiveTree"
+Issues = "https://github.com/ycrc/archiveTree/issues"
 
 [project.scripts]
 archive-to-s3 = "archive_to_s3:main"
@@ -30,6 +78,11 @@ browse-inventory = "browse_inventory:main"
 list-object-status = "list_object_status:main"
 
 [tool.setuptools]
+# Flat layout: these are top-level modules, not a package. Note that this
+# claims generic names (archive, restore, archive_config, globus_config) in
+# site-packages, so installing into a shared environment risks collisions.
+# Prefer `uv tool install` / `pipx install`, which isolate the tool in its
+# own venv.
 py-modules = [
     "archive_common",
     "archive_config",
