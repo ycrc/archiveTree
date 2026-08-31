@@ -35,6 +35,7 @@ import globus_config
 import globus_transfer
 
 from archive_common import (
+    VersionAction,
     vprint,
     print_config,
     select_relpaths,
@@ -52,6 +53,12 @@ from archive_common import (
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Restore a directory tree from an inventory file and a Globus archive."
+    )
+    # Mirrors the --version handled directly by the archive.py / restore.py
+    # dispatchers, so the per-backend entry points answer it too.
+    parser.add_argument(
+        "--version", action=VersionAction,
+        help="Show version, module location, and interpreter, then exit.",
     )
     parser.add_argument(
         "inventory_file", nargs="?", default=None,

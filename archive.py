@@ -18,6 +18,7 @@ exactly as if that backend's script had been invoked directly.
 import os
 import sys
 
+import archive_common
 import archive_config
 import archive_to_globus
 import archive_to_local
@@ -74,6 +75,13 @@ def extract_dispatch_flags(argv):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
+
+    # Handled before anything else so it works with no backend selected, no
+    # config file, and no readable inventory -- the situations where you are
+    # most likely to be asking which install you just invoked.
+    if "--version" in argv:
+        print(archive_common.version_string())
+        sys.exit(0)
 
     cli_backend, cli_config_file, remaining = extract_dispatch_flags(argv)
 

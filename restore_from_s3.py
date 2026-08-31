@@ -35,10 +35,11 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ProfileNotFound
 
 import archive_config
 from archive_common import (
+    VersionAction,
     vprint,
     print_config,
     select_relpaths,
@@ -72,16 +73,75 @@ RESTORE_REQUIRED_CLASSES = {"GLACIER", "DEEP_ARCHIVE"}
 
 # ---------- Utility ----------
 
+def _exit_profile_not_found(profile, exc):
+    """
+    Turn botocore's bare ProfileNotFound into an error that says where it
+    actually looked, and why that might not be where you expect.
+
+    The usual way to hit this is `sudo archive --backend s3 ...`: sudo resets
+    HOME to root's, so the `~/.aws/...` botocore expands becomes
+    /root/.aws/... rather than the invoking user's, and a profile that works
+    fine unprivileged suddenly does not exist. Left unhandled this surfaces as
+    a traceback that never mentions HOME, sudo, or the two environment
+    variables that override the lookup.
+    """
+    cred_file = (os.environ.get("AWS_SHARED_CREDENTIALS_FILE")
+                 or os.path.expanduser("~/.aws/credentials"))
+    config_file = (os.environ.get("AWS_CONFIG_FILE")
+                   or os.path.expanduser("~/.aws/config"))
+    lines = [
+        f"ERROR: AWS profile {profile!r} could not be found ({exc}).",
+        f"  Credentials file: {cred_file}",
+        f"  Config file:      {config_file}",
+    ]
+
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and hasattr(os, "geteuid") and os.geteuid() == 0:
+        user_home = os.path.expanduser("~" + sudo_user)
+        lines += [
+            "",
+            f"  Running as root under sudo: HOME is "
+            f"{os.path.expanduser('~')!r}, so the paths above are root's,",
+            f"  not {sudo_user}'s.",
+            "  Point botocore at the invoking user's files explicitly:",
+            "",
+            f"    sudo env \\",
+            f"      AWS_SHARED_CREDENTIALS_FILE={user_home}/.aws/credentials \\",
+            f"      AWS_CONFIG_FILE={user_home}/.aws/config \\",
+            f"      <command> --config-file {user_home}/.archive.cfg ...",
+            "",
+            "  `sudo env VAR=... cmd` rather than `sudo VAR=... cmd`: the latter is",
+            "  subject to the env_delete/env_check filtering in /etc/sudoers and can",
+            "  be silently dropped.",
+        ]
+    else:
+        lines += [
+            "",
+            "  Set AWS_SHARED_CREDENTIALS_FILE / AWS_CONFIG_FILE to override those",
+            "  locations, or drop `profile` from the config file to fall back to the",
+            "  default credential chain.",
+        ]
+
+    print("\n".join(lines), file=sys.stderr)
+    sys.exit(1)
+
+
 def get_s3_client(profile=None, endpoint_url=None):
     """Create a boto3 S3 client with optional profile and endpoint."""
-    if profile:
-        session = boto3.session.Session(profile_name=profile)
-    else:
-        session = boto3.session.Session()
+    try:
+        if profile:
+            session = boto3.session.Session(profile_name=profile)
+        else:
+            session = boto3.session.Session()
 
-    if endpoint_url:
-        return session.client("s3", endpoint_url=endpoint_url)
-    return session.client("s3")
+        if endpoint_url:
+            return session.client("s3", endpoint_url=endpoint_url)
+        return session.client("s3")
+    except ProfileNotFound as e:
+        # Current boto3 raises this from Session(), but config resolution has
+        # historically been deferred to client(), so cover both. `profile` is
+        # None when the name came from AWS_PROFILE rather than our config.
+        _exit_profile_not_found(profile or os.environ.get("AWS_PROFILE"), e)
 
 
 class DownloadProgressCallback:
@@ -492,6 +552,12 @@ def download_file_from_s3(
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Restore a directory tree from an inventory file and S3 archive."
+    )
+    # Mirrors the --version handled directly by the archive.py / restore.py
+    # dispatchers, so the per-backend entry points answer it too.
+    parser.add_argument(
+        "--version", action=VersionAction,
+        help="Show version, module location, and interpreter, then exit.",
     )
     parser.add_argument(
         "inventory_file",

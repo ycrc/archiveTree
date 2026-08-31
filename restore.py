@@ -91,6 +91,11 @@ def _guess_inventory_file(remaining):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
 
+    # See archive.py's main() -- handled first, before backend resolution.
+    if "--version" in argv:
+        print(archive_common.version_string())
+        sys.exit(0)
+
     cli_backend, cli_config_file, remaining = extract_dispatch_flags(argv)
 
     config_path = os.path.expanduser(

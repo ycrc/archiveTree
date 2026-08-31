@@ -12,6 +12,7 @@ globus_sdk importable.
 import json
 import os
 import stat
+import sys
 
 import globus_sdk
 from globus_sdk.scopes import TransferScopes
@@ -79,6 +80,65 @@ def interactive_login(client_id, scopes=TransferScopes.all, cache_path=DEFAULT_T
     return tokens
 
 
+def _refuse_root_login(cache_path):
+    """
+    Exit rather than start an interactive login when a missing token cache is
+    almost certainly an artifact of sudo rather than a genuine first login.
+
+    `sudo archive --backend globus ...` resets HOME to root's, so cache_path
+    becomes /root/.globus_archive_tokens.json -- a path that does not exist
+    because the *invoking* user has never logged in as root, not because they
+    have never logged in. Left alone, get_transfer_client() reads that as
+    "first run" and starts a browser login. Non-interactively that is an
+    EOFError on the code prompt; interactively it is worse, minting a second
+    long-lived refresh token for the user's Globus identity into root's home,
+    where their own --globus-logout will never find it to revoke.
+
+    Note this keys on the situation, not on how cache_path was derived: a
+    config file carrying `token_cache = ~/.globus_archive_tokens.json`
+    expands to root's copy under sudo exactly like the bare default does, so
+    setting it explicitly is not protection.
+
+    The "Archiving other users' files" section of README.md describes the
+    intended sudo invocation.
+    """
+    if os.environ.get("ARCHIVETREE_ALLOW_ROOT_LOGIN"):
+        return
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user:
+        return
+    if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        return
+
+    user_cache = os.path.join(
+        os.path.expanduser("~" + sudo_user), ".globus_archive_tokens.json"
+    )
+    print(
+        "\n".join([
+            f"ERROR: no cached Globus login at {cache_path}.",
+            "",
+            f"  Running as root under sudo: HOME is "
+            f"{os.path.expanduser('~')!r}, so that is root's token cache,",
+            f"  not {sudo_user}'s. Continuing would start a browser login and write",
+            "  a second refresh token for your Globus identity into root's home,",
+            "  where `--globus-logout` will not find it to revoke.",
+            "",
+            "  Point at the existing cache instead:",
+            "",
+            f"    sudo env GLOBUS_ARCHIVE_TOKEN_CACHE={user_cache} \\",
+            "      <command> ...",
+            "",
+            f"  or pass --token-cache {user_cache}.",
+            "",
+            "  If a root-owned token cache is genuinely intended (a dedicated admin",
+            "  identity rather than a borrowed one), set ARCHIVETREE_ALLOW_ROOT_LOGIN=1",
+            "  to permit the login.",
+        ]),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def get_transfer_client(client_id, cache_path=DEFAULT_TOKEN_CACHE, verbose=False, login_domain=None):
     """
     Return a globus_sdk.TransferClient authorized via a cached refresh
@@ -92,6 +152,8 @@ def get_transfer_client(client_id, cache_path=DEFAULT_TOKEN_CACHE, verbose=False
     tokens = load_tokens(cache_path)
 
     if tokens is None:
+        # Refuse an accidental root login before offering one; see the helper.
+        _refuse_root_login(cache_path)
         if verbose:
             print("No cached Globus login found; starting interactive login...")
         tokens = interactive_login(client_id, cache_path=cache_path, login_domain=login_domain)

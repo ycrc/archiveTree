@@ -14,6 +14,7 @@ download logic stays in the individual archive_to_*.py / restore_from_*.py
 scripts.
 """
 
+import argparse
 import base64
 import os
 import sys
@@ -179,6 +180,53 @@ def verify_object_checksum(local_path, obj, verbose=False):
         return "crc64nvme"
 
     return None
+
+
+def version_string():
+    """
+    Human-readable identification of *which* archiveTree is running.
+
+    Deliberately reports more than a version number, because the number alone
+    does not distinguish installs. A `uv tool install` pinned to a released
+    tag and an editable checkout of a working tree mid-development both report
+    whatever is in pyproject.toml -- so a stale install and a current one can
+    print the same version while behaving differently, which is exactly the
+    confusion this is meant to resolve. The module directory is the part that
+    actually disambiguates them.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            ver = version("archiveTree")
+        except PackageNotFoundError:
+            ver = "unknown (not installed as a distribution)"
+    except ImportError:  # pragma: no cover - importlib.metadata is stdlib >=3.8
+        ver = "unknown"
+
+    py = "{}.{}.{}".format(*sys.version_info[:3])
+    return "\n".join([
+        f"archiveTree {ver}",
+        f"  modules: {os.path.dirname(os.path.abspath(__file__))}",
+        f"  python:  {sys.executable} ({py})",
+    ])
+
+
+class VersionAction(argparse.Action):
+    """
+    An argparse --version that prints version_string() verbatim.
+
+    argparse's built-in action="version" routes its text through
+    HelpFormatter, which reflows it into a single wrapped paragraph -- which
+    would collapse the module and interpreter lines that are the entire
+    reason version_string() reports more than a number.
+    """
+
+    def __init__(self, option_strings, dest, help=None):
+        super().__init__(option_strings=option_strings, dest=dest, nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(version_string())
+        parser.exit()
 
 
 def get_owner(stat_result):

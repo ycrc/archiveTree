@@ -417,6 +417,21 @@ etc. in effect, not just what was passed on the command line. Useful for
 confirming which value a setting actually resolved to, since several of
 them can come from any of those three sources.
 
+**`--version` on every entry point** reports the installed version, the
+directory the modules were loaded from, and the interpreter running them:
+
+```console
+$ archive --version
+archiveTree 0.7.0
+  modules: /home/you/.local/share/uv/tools/archivetree/lib/python3.12/site-packages
+  python:  /home/you/.local/share/uv/tools/archivetree/bin/python (3.12.13)
+```
+
+It reports the module directory because the version number alone does not
+identify a build: a `uv tool install` pinned to a released tag and an editable
+checkout of that same tag both print the same number while potentially
+behaving differently. The `modules:` line is what distinguishes them.
+
 ---
 
 ## Archiving other users' files (as an administrator)
@@ -431,8 +446,13 @@ Nothing special is needed at archive time beyond the privilege to read the
 tree:
 
 ```bash
-sudo archive --backend local /gpfs/project/some_group /mnt/archive_storage
+sudo "$(command -v archive)" --config-file ~/.archive.cfg \
+    --backend local /gpfs/project/some_group /mnt/archive_storage
 ```
+
+(`sudo archive` on its own will not find the command, and `~/.archive.cfg`
+will not be found either — see [Running the command as root](#running-the-command-as-root)
+below for why.)
 
 Running as root also means files that would otherwise land in the inventory's
 `unreadable_files[]` list (permission denied while hashing) are simply read
@@ -441,7 +461,8 @@ normally.
 Restore as root to get ownership back:
 
 ```bash
-sudo restore some_group.inventory.<archive_id>.json.gz --restore-dir /gpfs/project/some_group
+sudo "$(command -v restore)" some_group.inventory.<archive_id>.json.gz \
+    --restore-dir /gpfs/project/some_group
 ```
 
 Ownership restoration is **automatic** — there is no flag to enable it. It
@@ -449,7 +470,7 @@ happens whenever both conditions hold: the process is root, and the inventory
 actually recorded uid/gid. To suppress it, pass `--no-restore-ownership`:
 
 ```bash
-sudo restore some_group.inventory.<archive_id>.json.gz \
+sudo "$(command -v restore)" some_group.inventory.<archive_id>.json.gz \
     --restore-dir /scratch/staging --no-restore-ownership
 ```
 
@@ -457,6 +478,168 @@ That is the right choice when you are staging an archive somewhere for
 inspection rather than putting the tree back where it came from — without it,
 the restored files (and the restore directory itself) are reassigned to their
 original owners.
+
+### Running the command as root
+
+`sudo archive ...` usually fails with "command not found". `sudo` replaces
+`PATH` with the fixed `secure_path` from `/etc/sudoers`, which drops the
+directory holding archiveTree's console scripts — whether they came from
+`uv tool install`, `pipx`, or `pixi shell`. Those scripts carry an absolute
+shebang, so they need no environment at all; just invoke them by full path:
+
+```bash
+sudo ~/.local/bin/archive --backend local /gpfs/project/some_group /mnt/archive_storage
+```
+
+Or let your shell resolve the path before `sudo` runs:
+
+```bash
+sudo "$(command -v archive)" --backend local /gpfs/project/some_group /mnt/archive_storage
+```
+
+> **Check what `command -v` actually resolves to before relying on it.** If you
+> have more than one archiveTree install — a `uv tool install` pinned to a
+> released tag *and* a `pixi shell` editable checkout, say — the one first on
+> `PATH` may not be the one you mean, and there is no error to tell you so: an
+> older build simply writes an inventory missing the newer fields.
+
+To see which install a name resolves to, and which source tree it loads:
+
+```bash
+command -v archive
+archive --version
+```
+
+Compare the `modules:` line against the install you meant to run. Note the
+version *number* will not distinguish two installs of the same tag — only the
+path will.
+
+An install predating this flag answers `--version` with an argparse usage
+error rather than a version banner. That is itself the answer: it is older
+than this section of the documentation. To inspect one, ask its own
+interpreter, from outside the checkout:
+
+```bash
+cd /tmp    # not the checkout -- cwd shadows the installed modules
+"$(head -1 "$(command -v archive)" | sed 's/^#!//')" \
+    -c 'import archive_common; print(archive_common.__file__)'
+```
+
+The `cd` matters: run from inside a checkout, Python puts the working
+directory first on `sys.path`, and you will see the checkout's modules no
+matter which install you are inspecting. When in doubt, give the absolute path
+of the install you want rather than relying on `PATH`.
+
+`sudo` also resets `HOME` to root's, so **`~/.archive.cfg` is not found** —
+`archive_config.py` expands it to `/root/.archive.cfg`. Pass the config
+explicitly:
+
+```bash
+sudo "$(command -v archive)" --config-file ~/.archive.cfg --backend local ...
+```
+
+(The `~` there expands in *your* shell, before `sudo` runs, so it is correct.)
+
+### The S3 backend under sudo
+
+The same reset `HOME` breaks AWS credential lookup, and it does so
+confusingly: botocore expands `~/.aws/credentials` to `/root/.aws/credentials`,
+your profile is not there, and a `profile = ...` setting that works fine
+unprivileged fails with "The config profile (NAME) could not be found".
+
+Botocore honors two environment variables that override the `~`-based lookup.
+Pass them through `sudo`:
+
+```bash
+sudo env \
+  AWS_SHARED_CREDENTIALS_FILE=$HOME/.aws/credentials \
+  AWS_CONFIG_FILE=$HOME/.aws/config \
+  "$(command -v archive)" --config-file $HOME/.archive.cfg \
+  --backend s3 /gpfs/project/some_group
+```
+
+Use `sudo env VAR=... cmd`, not `sudo VAR=... cmd`. The latter is subject to
+the `env_delete` / `env_check` filtering configured in `/etc/sudoers` and can
+be silently dropped; running `/usr/bin/env` as the command sets the variables
+*after* sudo has finished sanitizing the environment, so it always works.
+
+A shorter alternative is to set `HOME` itself, which fixes the AWS lookup and
+`~/.archive.cfg` together:
+
+```bash
+sudo HOME=$HOME "$(command -v archive)" --backend s3 /gpfs/project/some_group
+```
+
+This is fine for the S3 backend, which writes nothing to `$HOME`. See the next
+section before using it with the **Globus** backend, which does.
+
+Copying credentials into `/root/.aws/` also works, but duplicates a long-lived
+secret into a second location needing its own rotation and `0600` discipline.
+If several administrators do this routinely, prefer a dedicated service-account
+key over a copy of any one person's.
+
+### The Globus backend under sudo
+
+Globus already has a first-class fix — `--token-cache`, the
+`GLOBUS_ARCHIVE_TOKEN_CACHE` environment variable, and the `token_cache` config
+key — so no environment surgery is needed. But the *default* behavior under
+sudo is worse than S3's, because it does not fail:
+
+`globus_auth.py` caches the OAuth refresh token at
+`~/.globus_archive_tokens.json`. Under sudo that resolves to
+`/root/.globus_archive_tokens.json`, which does not exist, so
+`get_transfer_client()` treats it as "not logged in yet" and drops straight
+into an **interactive browser login**. Non-interactively (a batch job, a cron
+entry) that is an `EOFError` on the code prompt. Interactively it is worse:
+completing the login mints a *second* long-lived refresh token for your Globus
+identity and writes it to root's home, where your own `--globus-logout` will
+never find it to revoke.
+
+Point it at your real cache explicitly:
+
+```bash
+sudo env GLOBUS_ARCHIVE_TOKEN_CACHE=$HOME/.globus_archive_tokens.json \
+  "$(command -v archive)" --config-file $HOME/.archive.cfg \
+  --backend globus /gpfs/project/some_group
+```
+
+or equivalently with `--token-cache $HOME/.globus_archive_tokens.json`.
+
+Rather than let the login proceed, archiveTree stops with an error naming both
+of those when it detects the situation — root, under sudo, with no token at the
+path it was given. If a root-owned token cache is genuinely what you want (a
+dedicated administrative Globus identity rather than a borrowed personal one),
+set `ARCHIVETREE_ALLOW_ROOT_LOGIN=1` to permit the interactive login:
+
+```bash
+sudo env ARCHIVETREE_ALLOW_ROOT_LOGIN=1 \
+  GLOBUS_ARCHIVE_TOKEN_CACHE=/root/.globus_archive_tokens.json \
+  "$(command -v archive)" --backend globus ...
+```
+
+This only affects the "no cached token at all" case. Mid-transfer re-consent
+against an existing cache is unaffected and needs no opt-in.
+
+**Setting `token_cache` in the config file does not protect you.** Config
+values go through `archive_config.resolve()`, which calls `os.path.expanduser()`
+at resolution time — so a `~` in the config expands against *root's* home, not
+yours, exactly like the bare default does:
+
+```ini
+[globus]
+# Under sudo this resolves to /root/.globus_archive_tokens.json:
+token_cache = ~/.globus_archive_tokens.json
+
+# Sudo-proof:
+token_cache = /home/YOU/.globus_archive_tokens.json
+```
+
+Root then reads and rewrites your token file on refresh. That is fine for
+ownership — the file already exists, and rewriting truncates it in place rather
+than recreating it, so it keeps your uid — but it does mean a root process is
+handling your personal Globus credential. For anything beyond an occasional
+administrative restore, register a separate client and token cache for admin
+use rather than lending root your identity.
 
 ### Things worth knowing
 

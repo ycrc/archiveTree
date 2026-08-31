@@ -33,6 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import archive_config
 from archive_common import (
+    VersionAction,
     vprint,
     print_config,
     select_relpaths,
@@ -84,6 +85,12 @@ def copy_file_from_local(src_path, dest_path, expected_size=None, verbose=False,
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Restore a directory tree from an inventory file and a local archive."
+    )
+    # Mirrors the --version handled directly by the archive.py / restore.py
+    # dispatchers, so the per-backend entry points answer it too.
+    parser.add_argument(
+        "--version", action=VersionAction,
+        help="Show version, module location, and interpreter, then exit.",
     )
     parser.add_argument(
         "inventory_file",
