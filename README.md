@@ -72,6 +72,12 @@ lose or corrupt data:
   a restore, so permission bits survive the round trip regardless of how
   the file was stored (bundled in a tar or as its own object) or which
   Python version does the extracting.
+- **Ownership survives too, when you have the privilege to restore it.**
+  Each file's, symlink's, and directory's numeric uid/gid is recorded at
+  archive time and reapplied when the restore runs as root — so an
+  administrator can archive a tree spanning many users and restore it with
+  every file back under its original owner. See
+  [Archiving other users' files](#archiving-other-users-files-as-an-administrator).
 
 For the exact mechanics behind each of these — which function does what,
 and why S3 needs a different checksum algorithm than the other two
@@ -413,6 +419,72 @@ them can come from any of those three sources.
 
 ---
 
+## Archiving other users' files (as an administrator)
+
+archiveTree records each file's, symlink's, and directory's numeric uid/gid
+in the inventory, and reapplies them on restore **when the restore process is
+running as root**. That makes it usable for the administrative case: archiving
+a tree that spans many users — a departing group's shared project space, say —
+and later restoring it with every file back under its original owner.
+
+Nothing special is needed at archive time beyond the privilege to read the
+tree:
+
+```bash
+sudo archive --backend local /gpfs/project/some_group /mnt/archive_storage
+```
+
+Running as root also means files that would otherwise land in the inventory's
+`unreadable_files[]` list (permission denied while hashing) are simply read
+normally.
+
+Restore as root to get ownership back:
+
+```bash
+sudo restore some_group.inventory.<archive_id>.json.gz --restore-dir /gpfs/project/some_group
+```
+
+Ownership restoration is **automatic** — there is no flag to enable it. It
+happens whenever both conditions hold: the process is root, and the inventory
+actually recorded uid/gid. To suppress it, pass `--no-restore-ownership`:
+
+```bash
+sudo restore some_group.inventory.<archive_id>.json.gz \
+    --restore-dir /scratch/staging --no-restore-ownership
+```
+
+That is the right choice when you are staging an archive somewhere for
+inspection rather than putting the tree back where it came from — without it,
+the restored files (and the restore directory itself) are reassigned to their
+original owners.
+
+### Things worth knowing
+
+- **Ownership is restored numerically, never by name.** The recorded `uid`/
+  `gid` are applied as-is. This is correct on a cluster with a central
+  directory, where a uid means the same thing on every node. Restoring onto an
+  unrelated machine whose uids mean something else will faithfully apply
+  numbers that map to the wrong people — archiveTree makes no attempt to
+  translate. (The inventory's separate `owner` field is a username string
+  recorded for reference only; nothing applies it.)
+- **Restoring as a normal user still works.** Everything simply comes back
+  owned by you. If the inventory spans more than one uid, you get a single
+  warning saying so, since that case otherwise silently flattens a multi-user
+  tree.
+- **Archives predating this feature are unaffected.** Inventories written
+  before uid/gid were recorded restore exactly as they always did — no
+  ownership changes, no warnings, no version bump required.
+- **Failures don't abort the restore.** A `chown` that fails warns for that
+  path and is counted into a single summary line at the end. File contents are
+  already written and verified by that point; the restore is not rolled back.
+- **setuid/setgid binaries come back intact and owned by their original
+  user.** That is the correct behavior for an archiver whose job is fidelity,
+  and it is worth being deliberate about: restoring another user's tree as
+  root will materialize any setuid binary in it as a working setuid binary.
+  Inspect an untrusted tree before restoring it with privilege.
+
+---
+
 ## Unified entrypoints: `archive`, `restore`, `browse-inventory`
 
 These three commands (installed as console scripts by `pyproject.toml`; run
@@ -648,6 +720,7 @@ restore_from_s3.py [options] inventory_file
 | `--only-prefix PREFIX` | Restore only paths at or under this prefix (repeatable). Matched on path boundaries, so `logs` selects `logs/` but not a sibling `logs2`. |
 | `--verify-checksums` | Re-hash restored files and compare to the inventory. |
 | `--summary-csv PATH` | Write a CSV summary (`relative_path,full_path,size_bytes,verify_status`). |
+| `--no-restore-ownership` | Don't restore original uid/gid, even when running as root. Ownership is otherwise reapplied automatically whenever the restore runs as root and the inventory recorded it — see [Archiving other users' files](#archiving-other-users-files-as-an-administrator). |
 | `--keep-tar` | Don't delete downloaded tars after restore. |
 | `--dry-run` | Preview the plan; also reports Glacier/Deep Archive status. |
 | `--auto-request-restore` | Submit Glacier restore requests for cold objects, then exit — rerun once they're ready. |
@@ -776,6 +849,7 @@ from its location under `dest_dir` instead of being copied to
 | `--only-prefix PREFIX` | Restore only paths at or under this prefix (repeatable). Matched on path boundaries, so `logs` selects `logs/` but not a sibling `logs2`. |
 | `--verify-checksums` | Re-hash restored files and compare to the inventory. |
 | `--summary-csv PATH` | Write a CSV summary (`relative_path,full_path,size_bytes,verify_status`). |
+| `--no-restore-ownership` | Don't restore original uid/gid, even when running as root. Ownership is otherwise reapplied automatically whenever the restore runs as root and the inventory recorded it — see [Archiving other users' files](#archiving-other-users-files-as-an-administrator). |
 | `--dry-run` | Preview the plan; no copies, extraction, or writes. |
 | `--max-workers` | Parallel copy/verify workers. Default `4`. |
 | `--verbose` | Progress messages. |
@@ -936,6 +1010,7 @@ storage, so there's no `--auto-request-restore`/`--restore-days`/
 | `--only-path` / `--only-prefix` | Restore a subset, same as the S3 script. |
 | `--verify-checksums` | Re-hash restored files and compare to the inventory. |
 | `--summary-csv` | Write a CSV summary. |
+| `--no-restore-ownership` | Don't restore original uid/gid, even when running as root. Ownership is otherwise reapplied automatically whenever the restore runs as root and the inventory recorded it — see [Archiving other users' files](#archiving-other-users-files-as-an-administrator). |
 | `--keep-tar` | Don't delete downloaded tars after restore. |
 | `--dry-run` | Preview the plan. Works without Globus credentials. |
 | `--max-workers` | Parallel *local extraction/verify* workers. Default `4`. |

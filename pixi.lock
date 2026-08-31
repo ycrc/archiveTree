@@ -1008,7 +1008,9 @@ packages:
 - pypi: ./
   name: archivetree
   requires_dist:
-  - boto3>=1.26.163
+  - boto3>=1.43
   - globus-sdk>=3.41,<5
-  - tqdm>=4.64.1
-  requires_python: '>=3.9'
+  - tqdm>=4.70
+  - awscrt>=0.23 ; extra == 'checksums'
+  - archivetree[checksums] ; extra == 'all'
+  requires_python: '>=3.10'

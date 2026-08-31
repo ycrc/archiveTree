@@ -10,7 +10,7 @@ for usage.
 
 | File | Role |
 |---|---|
-| `archive_common.py` | Transport-agnostic core: inventory building, tar create/extract, checksum verification, size partitioning/grouping, inventory JSON read/write, `detect_backend()`. Imports neither `boto3` nor `globus_sdk`. |
+| `archive_common.py` | Transport-agnostic core: inventory building, tar create/extract, checksum verification, size partitioning/grouping, inventory JSON read/write, permission/ownership restoration, `detect_backend()`. Imports neither `boto3` nor `globus_sdk`. |
 | `archive_to_s3.py` / `restore_from_s3.py` | S3 backend (via `boto3`), with optional `[s3]`-section config-file support. |
 | `archive_to_globus.py` / `restore_from_globus.py` | Globus Transfer backend. |
 | `archive_to_local.py` / `restore_from_local.py` | Local filesystem backend: copies to/from a locally-mounted destination directory, with optional `[local]`-section config-file support. No SDK dependency at all. |
@@ -82,6 +82,8 @@ symlink under `root_dir`:
   "size_bytes": 512000,
   "ctime": "2026-08-10T09:00:00",
   "owner": "rdb9",
+  "uid": 10017,
+  "gid": 11133,
   "sha256": "...",
   "is_symlink": false,
   "mode": 420
@@ -115,12 +117,21 @@ unrecorded.
 
 `mode` is `stat.S_IMODE(st.st_mode)` — the
 POSIX permission bits (e.g. `420` decimal == `0o644`), captured from the
-same `os.lstat()` call used for everything else in the record. `owner` is
-purely informational (a username string from `pwd.getpwuid`); nothing on
-the restore path ever applies it — restored files are simply owned by
-whoever runs the restore. Directory permissions are never recorded at all.
-See [Permission handling](#permission-handling) below for how `mode` is
-(and isn't) restored.
+same `os.lstat()` call used for everything else in the record.
+
+`uid`/`gid` are the raw numeric `st_uid`/`st_gid` from that same `lstat()`,
+and are what the restore path actually reapplies when it runs as root — see
+[Permission handling](#permission-handling) below. `owner` predates them and
+remains purely informational: a username string from `pwd.getpwuid()`,
+resolved on the *archiving* host, never applied to anything. Ownership is
+restored numerically and never by name, which is correct on a cluster with a
+central directory (uids are consistent everywhere) and deliberately makes no
+attempt to be correct when restoring onto an unrelated machine whose uids
+mean something different.
+
+Both `uid` and `gid` are optional, exactly like `mode`: any inventory written
+before ownership was recorded simply lacks them, and every reader must treat
+a missing or `null` value as "don't touch it."
 
 Sockets, FIFOs, and device files are silently skipped with a warning
 (`archive_common.py:100`) since they can't be meaningfully archived. Files
@@ -135,7 +146,8 @@ empty ones** (collected from every `os.walk()` iteration, not inferred from
 file paths — `archive_common.py:158`):
 
 ```jsonc
-{ "relative_path": "data/raw", "file_count": 20, "total_bytes": 9773629, "mode": 493 }
+{ "relative_path": "data/raw", "file_count": 20, "total_bytes": 9773629,
+  "mode": 493, "uid": 10017, "gid": 11133 }
 ```
 
 `file_count`/`total_bytes` are recursive — everything under that directory,
@@ -145,13 +157,14 @@ not just its direct children. The root directory itself is the entry with
 show directory sizes without re-scanning the full `files` list on every
 navigation — it's a precomputed `du`, done once at archive time.
 
-`mode` (mirroring the per-file `mode` above) is `stat.S_IMODE(st.st_mode)`
-for the directory itself, captured via `os.lstat(dirpath)` alongside the
-same `os.walk()` pass
-(`archive_common.py:164`). It's `null` if that `lstat()` call itself failed
-(e.g. a race with something removing the directory mid-walk) — every reader
-must treat `mode` as optional, same as the per-file field. See
-[Permission handling](#permission-handling) for how it's used on restore.
+`mode`, `uid`, and `gid` (mirroring the per-file fields above) describe the
+directory itself, all captured from a single `os.lstat(dirpath)` during the
+same `os.walk()` pass in `build_inventory()`. All three are `null` together
+if that `lstat()` failed (e.g. a race with something removing the directory
+mid-walk) — every reader must treat them as optional, same as the per-file
+fields. A directory that only ever appears as some file's ancestor, rather
+than in the walk itself, likewise gets all-`null` metadata. See
+[Permission handling](#permission-handling) for how they're used on restore.
 
 ### `archive` section and object records
 
@@ -226,7 +239,8 @@ normally with everything else.
 
 Every restored file's permission bits come from the `mode` its inventory
 record recorded at archive time, applied explicitly — never inherited from
-whatever the transport happened to produce:
+whatever the transport happened to produce. Ownership works the same way,
+from the recorded `uid`/`gid`, whenever the restore is running as root:
 
 - **All files**, whichever storage path they took:
   `restore_file_permissions()` (`archive_common.py`, shared by all three
@@ -254,8 +268,17 @@ whatever the transport happened to produce:
   absolute/escaping symlink targets archiveTree deliberately records), and
   `restore_file_permissions()` makes the final mode correct regardless of
   interpreter behavior.
-- **Ownership** (uid/gid) is *not* restored by tar extraction in practice,
-  since `tarfile.chown()` only attempts `os.chown()` when running as root.
+- **Ownership** is applied by `restore_file_permissions()` /
+  `restore_directory_permissions()` from the inventory's `uid`/`gid`, not
+  left to the transport. Tar members do carry `uid`/`gid`/`uname`/`gname`
+  (a plain `tar.add()` records them, and PAX stores both), and under the
+  pinned `fully_trusted` filter `tarfile.chown()` would apply them — but
+  only when running as root, and only for files that happened to travel
+  inside a tar. Large files stored as their own object are written by
+  `shutil.copy2`/`boto3` and never chowned at all. Relying on that would
+  reproduce exactly the large-vs-small asymmetry the `mode` handling above
+  exists to eliminate, so ownership is driven from the inventory instead,
+  uniformly for both storage paths.
 - **Directories**: `restore_directory_permissions()` (`archive_common.py`,
   shared by all three restore scripts) runs once, after `restore_file_permissions()`
   — files first, so a directory whose recorded mode lacks write/execute
@@ -285,9 +308,44 @@ whatever the transport happened to produce:
      that child unreachable for its own `chmod()` call, so children are
      always done first. A directory with a `null` `mode` (its `lstat()`
      failed at archive time) is simply skipped.
-- **Ownership** is recorded (the `owner` username string) but never
-  restored by anything in this codebase, for either storage path or either
-  files/directories.
+- **Ownership ordering — `chown` before `chmod`, always.** This is the one
+  non-obvious rule in this section. On Linux `chown()` clears the setuid and
+  setgid bits, and since 2.2.13 it does so *even for root*; it does so even
+  when the new owner is identical to the old one. Applying mode first and
+  ownership second would therefore silently strip exactly the setgid bit
+  that `extract_tar()`'s `fully_trusted` pinning exists to preserve, and
+  `--verify-checksums` would never catch it, since it only compares content
+  hashes. Both restore passes consequently `chown()` each path immediately
+  *before* its `chmod()`, per path, so the mode is always what lands last.
+
+- **Symlinks** are chowned with `os.lchown()`, never `os.chown()`. Unlike
+  mode — which is meaningless on a symlink and skipped — a symlink's own
+  ownership is real, and `chown()` would follow the link and change whatever
+  it points at, possibly something outside the restored tree entirely.
+
+- **When it happens.** Ownership restoration is automatic whenever the
+  restore process is root (`can_restore_ownership()`, i.e. `os.geteuid() == 0`)
+  and the inventory carries `uid`/`gid`. `--no-restore-ownership` turns it
+  off; an inventory written before ownership was recorded is a silent no-op.
+  A non-root restore of an inventory spanning more than one uid warns once,
+  since that case otherwise silently collapses a multi-user tree onto the
+  invoking user. Individual `chown()` failures warn per path and are counted
+  into one unconditional summary line, but never abort a restore whose
+  contents are already correct and verified — matching the existing
+  best-effort semantics for `chmod()`.
+
+- **The restore root itself** (the `directories[]` entry with
+  `relative_path == ""`) is chowned along with everything else, exactly as
+  its `mode` is already chmod'ed. Restoring into a staging directory
+  therefore reassigns that directory to the archived tree's original owner;
+  pass `--no-restore-ownership` if that isn't wanted.
+
+- **Security note.** Restoring as root faithfully reproduces original
+  ownership on setuid/setgid files, which means a setuid binary in the
+  archived tree comes back as a working setuid binary owned by its original
+  user. That is the correct behavior for a fidelity-preserving archiver, but
+  an administrator restoring another user's tree should know it is what will
+  happen.
 
 ## Data integrity and validation
 
@@ -667,13 +725,18 @@ again all share the same shape, diverging on transfer mechanics.
    exactly that, naming the object id, instead of surfacing as a confusing
    tar-extraction failure or a pile of mismatched files much later.
 
-6. **`restore_file_permissions()` then `restore_directory_permissions()`**
-   (`archive_common.py`, unconditional, no flag): every restored file is
-   chmod'ed to its recorded `mode`, then any recorded, in-scope directory
-   that doesn't already exist is created (e.g. one that was empty in the
-   original tree) and every directory with a recorded `mode` under
-   `restore_root` is chmod'ed deepest-first. Files before directories, so a
-   restrictive directory mode can't block a file chmod inside it. See
+6. **`restore_permissions_and_ownership()`** (`archive_common.py`) — the
+   single chokepoint all three backends call. It decides whether ownership
+   applies (requested *and* running as root), emits the multi-owner warning
+   where relevant, then runs `restore_file_permissions()` followed by
+   `restore_directory_permissions()`: every restored file is chowned (as
+   root) and chmod'ed to its recorded metadata, then any recorded, in-scope
+   directory that doesn't already exist is created (e.g. one that was empty
+   in the original tree) and every directory under `restore_root` is chowned
+   and chmod'ed deepest-first. Files before directories, so a restrictive
+   directory mode can't block a file chmod inside it; and within each path,
+   chown before chmod, so `chown()`'s clearing of setuid/setgid can't
+   survive into the final state. See
    [Permission handling](#permission-handling) above.
 
 7. **Optional `--verify-checksums`**: `verify_restored_files()`

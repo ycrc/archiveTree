@@ -45,8 +45,7 @@ from archive_common import (
     extract_tar,
     verify_object_checksum,
     verify_restored_files,
-    restore_directory_permissions,
-    restore_file_permissions,
+    restore_permissions_and_ownership,
     write_summary_csv,
     check_inventory_version,
     load_inventory_file,
@@ -551,6 +550,19 @@ def build_arg_parser():
         help="After extraction, recompute SHA256 checksums and compare to inventory."
     )
     parser.add_argument(
+        "--no-restore-ownership",
+        action="store_false",
+        dest="restore_ownership",
+        help=(
+            "Do not restore each file's original uid/gid, even when running "
+            "as root. Ownership is otherwise restored automatically whenever "
+            "the restore runs as root and the inventory recorded it (archives "
+            "written before uid/gid were recorded are unaffected either way). "
+            "Use this to restore an administrator-made archive into a scratch "
+            "area owned by the invoking user."
+        ),
+    )
+    parser.add_argument(
         "--summary-csv",
         default=None,
         help="Write a CSV summary of restored files to this path."
@@ -856,13 +868,14 @@ def run(args):
             if tpath:
                 temp_tars.append(tpath)
 
-    # Restore permission bits now that all file content has been written:
-    # files first, then directories deepest-first, so a restrictive
-    # directory mode never blocks a chmod still to come inside it.
-    restore_file_permissions(inventory, restore_root, subset_relpaths=selected_relpaths, verbose=verbose)
-    restore_directory_permissions(
-        inventory, restore_root, only_prefixes=args.only_prefix,
-        only_paths=args.only_path, verbose=verbose,
+    # Restore permission bits (and, as root, original uid/gid) now that all
+    # file content has been written: files first, then directories
+    # deepest-first, so a restrictive directory mode never blocks a chmod
+    # still to come inside it.
+    restore_permissions_and_ownership(
+        inventory, restore_root, subset_relpaths=selected_relpaths,
+        only_prefixes=args.only_prefix, only_paths=args.only_path,
+        restore_ownership=args.restore_ownership, verbose=verbose,
     )
 
     # Optional checksum verification

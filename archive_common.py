@@ -189,6 +189,38 @@ def get_owner(stat_result):
         return str(stat_result.st_uid)
 
 
+def can_restore_ownership():
+    """
+    True if this process can chown a file to an arbitrary uid/gid -- i.e. is
+    running as root.
+
+    An unprivileged process can only ever chgrp to a group it already belongs
+    to, and can never change a file's owner at all, so attempting it would
+    just produce an EPERM per file. The restore path uses this to decide
+    whether to try at all, rather than warning once per file.
+    """
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def inventory_owner_count(inventory):
+    """
+    Number of distinct uids recorded across an inventory's files and
+    directories. Used to warn when a multi-user tree is about to be restored
+    by a non-root process, which would collapse every file onto the invoking
+    user.
+    """
+    uids = set()
+    for rec in inventory.get("files", []):
+        uid = rec.get("uid")
+        if uid is not None:
+            uids.add(uid)
+    for rec in inventory.get("directories", []):
+        uid = rec.get("uid")
+        if uid is not None:
+            uids.add(uid)
+    return len(uids)
+
+
 # ---------- Inventory Building ----------
 
 def _checksum_one(path, root_dir, verbose=False):
@@ -228,6 +260,8 @@ def _checksum_one(path, root_dir, verbose=False):
             "size_bytes": st.st_size,      # length of link target string
             "ctime": datetime.fromtimestamp(st.st_ctime).isoformat(),
             "owner": get_owner(st),
+            "uid": st.st_uid,
+            "gid": st.st_gid,
             "sha256": sha,
             "is_symlink": True,
             "symlink_target": link_target,
@@ -247,6 +281,8 @@ def _checksum_one(path, root_dir, verbose=False):
             "size_bytes": st.st_size,
             "ctime": datetime.fromtimestamp(st.st_ctime).isoformat(),
             "owner": get_owner(st),
+            "uid": st.st_uid,
+            "gid": st.st_gid,
             "sha256": sha,
             "is_symlink": False,
             "mode": stat.S_IMODE(st.st_mode),
@@ -265,7 +301,11 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
 
     file_list = []
     dir_relpaths = []
-    dir_modes = {}
+    # Per-directory metadata captured during the walk: mode plus the numeric
+    # uid/gid the restore path reapplies when running as root. All three come
+    # from one lstat() and are all None together if it fails, mirroring how a
+    # per-file record's fields are treated as optional by every reader.
+    dir_meta = {}
     scan_pbar = None
     if verbose and tqdm:
         scan_pbar = tqdm(desc="Scanning", unit="files")
@@ -275,10 +315,15 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
             relpath = ""
         dir_relpaths.append(relpath)
         try:
-            dir_modes[relpath] = stat.S_IMODE(os.lstat(dirpath).st_mode)
+            dst = os.lstat(dirpath)
+            dir_meta[relpath] = {
+                "mode": stat.S_IMODE(dst.st_mode),
+                "uid": dst.st_uid,
+                "gid": dst.st_gid,
+            }
         except OSError as e:
             vprint(verbose, f"WARNING: failed to stat directory {dirpath}: {e}")
-            dir_modes[relpath] = None
+            dir_meta[relpath] = {"mode": None, "uid": None, "gid": None}
         if scan_pbar is not None:
             scan_pbar.set_postfix_str(dirpath, refresh=False)
         for name in filenames:
@@ -343,16 +388,24 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
     # Roll up file_count/total_bytes for every directory (including empty
     # ones), recursively covering everything in its subtree. "" denotes the
     # root directory itself.
-    dir_stats = {
-        relpath: {"file_count": 0, "total_bytes": 0, "mode": dir_modes.get(relpath)}
-        for relpath in dir_relpaths
-    }
+    def _new_dir_stats(relpath):
+        # Seeded from the walk's lstat() where we have one; a directory that
+        # only ever shows up as some file's ancestor (not in dir_relpaths)
+        # gets all-None metadata, same as a failed stat.
+        meta = dir_meta.get(relpath) or {}
+        return {
+            "file_count": 0,
+            "total_bytes": 0,
+            "mode": meta.get("mode"),
+            "uid": meta.get("uid"),
+            "gid": meta.get("gid"),
+        }
+
+    dir_stats = {relpath: _new_dir_stats(relpath) for relpath in dir_relpaths}
     for rec in file_records:
         parent = os.path.dirname(rec["relative_path"])
         while True:
-            stats = dir_stats.setdefault(
-                parent, {"file_count": 0, "total_bytes": 0, "mode": dir_modes.get(parent)}
-            )
+            stats = dir_stats.setdefault(parent, _new_dir_stats(parent))
             stats["file_count"] += 1
             stats["total_bytes"] += rec["size_bytes"]
             if parent == "":
@@ -365,6 +418,8 @@ def build_inventory(root_dir, verbose=False, max_workers=1):
             "file_count": stats["file_count"],
             "total_bytes": stats["total_bytes"],
             "mode": stats["mode"],
+            "uid": stats["uid"],
+            "gid": stats["gid"],
         }
         for relpath, stats in sorted(dir_stats.items())
     ]
@@ -715,7 +770,61 @@ def verify_restored_files(inventory, restore_root,
     return status_map
 
 
-def restore_file_permissions(inventory, restore_root, subset_relpaths=None, verbose=False):
+def restore_permissions_and_ownership(inventory, restore_root, subset_relpaths=None,
+                                      only_prefixes=None, only_paths=None,
+                                      restore_ownership=True, verbose=False):
+    """
+    Reapply recorded metadata after all file content has been written: files
+    first, then directories deepest-first, so a restrictive directory mode
+    never blocks a chmod still to come inside it.
+
+    This is the single chokepoint all three backends call. restore_ownership
+    is what the user asked for (it defaults on, and --no-restore-ownership
+    turns it off); whether ownership is *actually* restored additionally
+    requires running as root, which is resolved here rather than in each
+    backend.
+
+    Returns the number of paths whose ownership could not be applied.
+    """
+    apply_ownership = restore_ownership and can_restore_ownership()
+
+    if restore_ownership and not apply_ownership and inventory_owner_count(inventory) > 1:
+        # Only worth saying when the tree actually spans several owners: a
+        # single-owner tree restored by its owner is already correct, but a
+        # multi-user tree silently collapsing onto the invoking user is the
+        # failure mode an administrator most needs to be told about.
+        print(
+            "WARNING: this inventory records files owned by multiple users, but "
+            "this restore is not running as root -- every restored file will be "
+            "owned by the invoking user. Re-run under sudo to restore original "
+            "ownership.",
+            file=sys.stderr,
+        )
+
+    failures = restore_file_permissions(
+        inventory, restore_root, subset_relpaths=subset_relpaths,
+        restore_ownership=apply_ownership, verbose=verbose,
+    )
+    failures += restore_directory_permissions(
+        inventory, restore_root, only_prefixes=only_prefixes,
+        only_paths=only_paths, restore_ownership=apply_ownership, verbose=verbose,
+    )
+
+    if failures:
+        # Unconditional, not --verbose-gated: a restore that came back
+        # partially mis-owned is something an administrator has to know about,
+        # and the per-path warnings above can easily scroll away.
+        print(
+            f"WARNING: failed to restore ownership on {failures} path(s); "
+            "those paths are owned by the invoking user instead.",
+            file=sys.stderr,
+        )
+
+    return failures
+
+
+def restore_file_permissions(inventory, restore_root, subset_relpaths=None,
+                             restore_ownership=False, verbose=False):
     """
     Apply each restored file's recorded POSIX permission bits, from its
     inventory record's "mode" field.
@@ -732,10 +841,27 @@ def restore_file_permissions(inventory, restore_root, subset_relpaths=None, verb
 
     Applied before restore_directory_permissions(), so a directory whose
     recorded mode lacks write/execute doesn't block chmod'ing the files
-    inside it. Symlinks are skipped: os.chmod() would follow the link and
-    change the *target's* mode, and a symlink's own bits aren't meaningful
-    on Linux anyway. Best-effort -- a failure warns rather than aborting a
-    restore whose file contents are already correct and verified.
+    inside it. Symlinks are skipped for chmod: os.chmod() would follow the
+    link and change the *target's* mode, and a symlink's own bits aren't
+    meaningful on Linux anyway. Best-effort -- a failure warns rather than
+    aborting a restore whose file contents are already correct and verified.
+
+    With restore_ownership=True (see can_restore_ownership(); only meaningful
+    as root), each record's recorded numeric uid/gid is applied too. Two
+    things matter here:
+
+    - **chown comes before chmod, always.** On Linux chown() clears the
+      setuid/setgid bits, and since 2.2.13 it does so even for root. Doing it
+      the other way round would silently strip the setgid bit that this
+      codebase goes out of its way to preserve everywhere else (see the
+      TARFILE_SUPPORTS_FILTER comment and extract_tar()).
+    - **Symlinks use os.lchown(), not os.chown().** Unlike mode, a symlink's
+      ownership *is* meaningful, and chown() would retarget the link and
+      change the ownership of whatever it points at -- possibly something
+      outside the restored tree entirely.
+
+    A record with no uid/gid (any inventory written before ownership was
+    recorded) is simply left alone, exactly like a null mode.
     """
     records_by_rel = {rec["relative_path"]: rec for rec in inventory.get("files", [])}
     if subset_relpaths is None:
@@ -744,13 +870,47 @@ def restore_file_permissions(inventory, restore_root, subset_relpaths=None, verb
         target_relpaths = [rp for rp in subset_relpaths if rp in records_by_rel]
 
     applied = 0
+    chowned = 0
+    chown_failures = 0
     for relpath in target_relpaths:
         rec = records_by_rel[relpath]
         mode = rec.get("mode")
-        if mode is None or rec.get("is_symlink", False):
-            continue
+        uid = rec.get("uid")
+        gid = rec.get("gid")
+        is_symlink = rec.get("is_symlink", False)
         full_path = os.path.join(restore_root, relpath)
+
+        if is_symlink:
+            # Nothing to chmod, but ownership still applies -- via lchown, so
+            # the link itself is retargeted rather than its destination.
+            if not restore_ownership or uid is None or gid is None:
+                continue
+            if not os.path.islink(full_path):
+                continue
+            try:
+                os.lchown(full_path, uid, gid)
+                chowned += 1
+            except OSError as e:
+                chown_failures += 1
+                print(f"WARNING: failed to restore ownership on {full_path}: {e}",
+                      file=sys.stderr)
+            continue
+
         if not os.path.isfile(full_path) or os.path.islink(full_path):
+            continue
+
+        # Ownership first: chown() clears setuid/setgid, so the chmod below
+        # has to be what lands last.
+        if restore_ownership and uid is not None and gid is not None:
+            try:
+                os.chown(full_path, uid, gid)
+                chowned += 1
+            except OSError as e:
+                chown_failures += 1
+                print(f"WARNING: failed to restore ownership on {full_path}: {e}",
+                      file=sys.stderr)
+
+        if mode is None:
             continue
         try:
             os.chmod(full_path, mode)
@@ -759,10 +919,14 @@ def restore_file_permissions(inventory, restore_root, subset_relpaths=None, verb
             print(f"WARNING: failed to restore permissions on {full_path}: {e}", file=sys.stderr)
 
     vprint(verbose, f"Restored permission bits on {applied} file(s).")
+    if restore_ownership:
+        vprint(verbose, f"Restored ownership on {chowned} file(s)/symlink(s).")
+    return chown_failures
 
 
 def restore_directory_permissions(inventory, restore_root, only_prefixes=None,
-                                  only_paths=None, verbose=False):
+                                  only_paths=None, restore_ownership=False,
+                                  verbose=False):
     """
     Create any recorded directory that's empty (tar extraction only creates
     the parent dirs its member files need, so nothing else ever creates an
@@ -787,6 +951,13 @@ def restore_directory_permissions(inventory, restore_root, only_prefixes=None,
     after all file content has been written, so setting a restrictive mode
     (e.g. missing write/execute bits) on a parent never blocks creating or
     chmod'ing something still to come inside it.
+
+    With restore_ownership=True (only meaningful as root), each directory's
+    recorded numeric uid/gid is applied immediately before its chmod, for the
+    same reason as in restore_file_permissions(): chown() clears setuid/setgid
+    on Linux even for root, so the chmod has to land last. Directories created
+    by the empty-directory pass above are covered automatically, since that
+    pass runs first within this same function.
     """
     directories = inventory.get("directories", [])
     filtered = bool(only_prefixes or only_paths)
@@ -828,12 +999,27 @@ def restore_directory_permissions(inventory, restore_root, only_prefixes=None,
         reverse=True,
     )
 
+    chowned = 0
+    chown_failures = 0
     for rec in ordered:
         mode = rec.get("mode")
-        if mode is None:
-            continue
+        uid = rec.get("uid")
+        gid = rec.get("gid")
         full_path = os.path.join(restore_root, rec["relative_path"])
         if not os.path.isdir(full_path):
+            continue
+
+        # Ownership first: chown() clears setuid/setgid, so chmod lands last.
+        if restore_ownership and uid is not None and gid is not None:
+            try:
+                os.chown(full_path, uid, gid)
+                chowned += 1
+            except OSError as e:
+                chown_failures += 1
+                print(f"WARNING: failed to restore ownership on {full_path}: {e}",
+                      file=sys.stderr)
+
+        if mode is None:
             continue
         try:
             os.chmod(full_path, mode)
@@ -841,6 +1027,9 @@ def restore_directory_permissions(inventory, restore_root, only_prefixes=None,
             print(f"WARNING: failed to restore permissions on {full_path}: {e}", file=sys.stderr)
 
     vprint(verbose, "Restored directory permissions where recorded.")
+    if restore_ownership:
+        vprint(verbose, f"Restored ownership on {chowned} director(ies).")
+    return chown_failures
 
 
 def write_summary_csv(inventory, restore_root, subset_relpaths, verify_status,
