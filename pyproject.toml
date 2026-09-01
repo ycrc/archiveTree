@@ -76,6 +76,7 @@ archive = "archive:main"
 restore = "restore:main"
 browse-inventory = "browse_inventory:main"
 list-object-status = "list_object_status:main"
+apply-ownership = "apply_ownership:main"
 
 [tool.setuptools]
 # Flat layout: these are top-level modules, not a package. Note that this
@@ -98,5 +99,6 @@ py-modules = [
     "globus_config",
     "globus_transfer",
     "browse_inventory",
+    "apply_ownership",
     "list_object_status",
 ]

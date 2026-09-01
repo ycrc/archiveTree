@@ -641,6 +641,67 @@ handling your personal Globus credential. For anything beyond an occasional
 administrative restore, register a separate client and token cache for admin
 use rather than lending root your identity.
 
+### Splitting transfer from ownership: `apply-ownership`
+
+The Globus backend cannot do a one-shot root restore the way S3 and local
+can, and the reason is structural rather than a permissions mistake.
+
+Globus Connect Server performs its file I/O as **the local account your Globus
+identity maps to**, not as the user who ran the client. So under
+`sudo restore --backend globus`, root creates the destination and scratch
+directories (owned `root:root`, mode `0755`) and the GridFTP data mover — a
+different user entirely — then fails to write into them:
+
+```
+500-globus_xio: Unable to open file .../restore_tar-000000.tar
+500-globus_xio: System error in open: Permission denied
+```
+
+`sudo` cannot fix this, because the half that needs to write is not the half
+running under `sudo`.
+
+Only the `chown` pass actually needs root; the transfer does not. So run them
+separately — restore unprivileged, so the transfer writes as the identity
+doing the transferring, then apply ownership as root:
+
+```bash
+# 1. Unprivileged: content lands correctly, ownership is simply not applied.
+restore --backend globus lf595.inventory.<archive_id>.json.gz \
+    --restore-dir ~/restores/lf595
+
+# 2. As root: put ownership back from the inventory. No backend, no
+#    credentials, no network.
+sudo "$(command -v apply-ownership)" lf595.inventory.<archive_id>.json.gz \
+    --restore-dir ~/restores/lf595
+```
+
+`apply-ownership` reads `uid`/`gid`/`mode` from the inventory and applies them
+to files already on disk. It imports nothing beyond `archive_common`, so it
+works for **all three backends** — and is equally useful whenever a restore
+ran unprivileged and ownership needs applying afterwards.
+
+Check first with `--dry-run`, which works without root and changes nothing:
+
+```console
+$ apply-ownership lf595.inventory.<archive_id>.json.gz --restore-dir ~/restores/lf595 --dry-run
+  /home/you/restores/lf595/workshop/test.txt: owner 1000:1000 -> 25134:11133
+  /home/you/restores/lf595/workshop: owner 1000:1000 -> 25134:11133
+
+Dry run: 2 path(s) would change.
+```
+
+It accepts `--only-path` / `--only-prefix` with the same meaning as the restore
+scripts, and refuses to run for real without root rather than silently applying
+permission bits alone. An inventory predating uid/gid recording is rejected
+outright, since there would be nothing to apply.
+
+If you would rather keep the single-command flow for a Globus restore, the
+other option is to pre-create the directories Globus writes into so they are
+owned by your mapped account — `--scratch-dir` pointing somewhere you own. Be
+aware that this only covers tar objects: files larger than `--size-cutoff` are
+transferred straight to their final path, into subdirectories root creates, and
+those will still be refused.
+
 ### Things worth knowing
 
 - **Ownership is restored numerically, never by name.** The recorded `uid`/
